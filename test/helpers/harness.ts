@@ -4,21 +4,26 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
-  createAgentSession, DefaultResourceLoader, SessionManager, SettingsManager,
+  createAgentSession, createToolSearchExtension, DefaultResourceLoader, SessionManager, SettingsManager,
   type ExtensionAPI, type ExtensionUIContext,
 } from "@earendil-works/pi-coding-agent";
 import { fauxAssistantMessage as reply, fauxToolCall as call, type FauxResponseStep, type ToolCall } from "@earendil-works/pi-ai";
 import { createBrowserExtension, type BrowserExtensionOptions } from "../../src/extension/index.js";
 import { fauxRuntime } from "./faux.js";
+import type { EngineManager } from "../../src/manager.js";
 
 export const tool = (name: string, args: ToolCall["arguments"]) => reply([call(name, args)], { stopReason: "toolUse" });
 const fakeServer = fileURLToPath(new URL("./fake-mcp-server.mjs", import.meta.url));
+export const fakeChromeServer = fileURLToPath(new URL("./fake-chrome-mcp.mjs", import.meta.url));
 
 /** Real AgentSession, independent faux runtime, and a test-owned stdio MCP child. */
 export async function createHarness(options: {
   steps?: FauxResponseStep[];
   config?: Record<string, unknown>;
   extension?: BrowserExtensionOptions;
+  /** Enable the fake Chrome engine, or supply an explicit real/fake child launcher. */
+  chrome?: boolean;
+  launchChrome?: () => ChildProcess;
   confirm?: boolean | ((title: string, message: string) => boolean | Promise<boolean>);
   hasUI?: boolean;
 } = {}) {
@@ -31,17 +36,27 @@ export async function createHarness(options: {
   const main = await fauxRuntime(options.steps);
   const children: ChildProcess[] = [];
   let extensionApi: ExtensionAPI;
+  let manager: EngineManager;
   const settingsManager = SettingsManager.inMemory({ compaction: { enabled: false } });
   const resourceLoader = new DefaultResourceLoader({
     cwd, agentDir, settingsManager, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
-    extensionFactories: [(pi) => {
+    extensionFactories: [createToolSearchExtension(), (pi) => {
       extensionApi = pi;
       createBrowserExtension({
+        engineAvailability: { chrome: () => ({ ok: false, reason: "chrome engine disabled in config" }) },
+        ...(options.chrome || options.launchChrome ? {
+          engineAvailability: { chrome: () => ({ ok: true }) },
+          launchChrome: () => {
+            const child = options.launchChrome?.() ?? spawn(process.execPath, [fakeChromeServer], { stdio: "pipe", detached: true });
+            children.push(child); return child;
+          },
+        } : {}),
         agentDir, launch: () => {
           const child = spawn(process.execPath, [fakeServer], { stdio: "pipe" });
           children.push(child);
           return child;
         }, ...options.extension,
+        onManager: (value) => { manager = value; options.extension?.onManager?.(value); },
       })(pi);
     }],
   });
@@ -67,6 +82,7 @@ export async function createHarness(options: {
   await session.bindExtensions(options.hasUI === false ? {} : { uiContext });
   return {
     session, main, children, cwd, agentDir, notifications, statuses, errors, confirmations,
+    get manager() { return manager!; },
     getMcpServers: () => extensionApi!.getMcpServers(),
     async shutdown() { await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" }); },
     async dispose() {

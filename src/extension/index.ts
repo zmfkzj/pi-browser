@@ -7,29 +7,37 @@ import { managedBinaryPath, managedCacheDir, resolveObscuraBinary, type BinaryRe
 import { DEFAULT_BROWSER_CONFIG, isValidProfileName, loadBrowserConfig, validateBrowserConfig, type BrowserConfig, type LoadedBrowserConfig } from "../config.js";
 import { storageState } from "../actions.js";
 import { installObscura, type InstallObscuraResult } from "../install.js";
-import { buildObscuraArgs } from "../mcp-client.js";
+import { buildObscuraArgs, ObscuraEngine } from "../engines/obscura.js";
+import { EngineManager, type Availability } from "../manager.js";
+import { ChromeEngine, chromeAvailability, buildChromeArgs } from "../engines/chrome.js";
+import type { BrowserEngine, EngineName } from "../engine.js";
+import { toolExposure, deferredToolGuideline } from "../exposure.js";
 import { registerFetchTool } from "../fetch.js";
 import { defaultSpillDir, mcpContentToToolContent, type McpContent } from "../output.js";
-import { checkedText, summarizePage } from "../page.js";
-import { BrowserSession } from "../session.js";
+import { summarizePage } from "../page.js";
 import { registerInteractionTools } from "./tools.js";
 import { decodeEvaluation, wrapExpression } from "../evaluate.js";
-import { applyPendingStorage, restoreStorageState, validateRestorableState, type PendingStorage } from "../state.js";
+import { applyPendingStorage, restoreStorageState, validateRestorableState } from "../state.js";
 export { decodeEvaluation, wrapExpression } from "../evaluate.js";
 
 export interface BrowserExtensionOptions {
   agentDir?: string;
   launch?: () => ChildProcess;
+  /** Test/embedding seam: launch a piped Chrome MCP child instead of the bundled server. */
+  launchChrome?: () => ChildProcess;
   now?: () => number;
   env?: NodeJS.ProcessEnv;
   pathDirs?: string[];
   install?: typeof installObscura;
   launchFetch?: (args: string[]) => ChildProcess;
   fetchKillGraceMs?: number;
+  engineFactories?: Partial<Record<EngineName, () => BrowserEngine>>;
+  engineAvailability?: Partial<Record<EngineName, () => Availability>>;
+  onManager?: (manager: EngineManager) => void;
 }
 
-export const BROWSER_USAGE = "Usage: /browser status | stop | restart | install [version] | allow-private-network on|off | profile save|load|clear [name]";
-const REF_GUIDELINE = "Browser refs (e1, e2, …) are invalidated by every action and navigation; use the refs from the latest result.";
+export const BROWSER_USAGE = "Usage: /browser status | engine [obscura|chrome] | stop | restart | install [version] | allow-private-network on|off | profile save|load|clear [name] (stop: all engines; restart: active engine)";
+const REF_GUIDELINE = "Browser refs are engine-specific and are invalidated by every action and navigation; use the refs from the latest result.";
 
 
 export function createBrowserExtension(options: BrowserExtensionOptions = {}) {
@@ -38,7 +46,8 @@ export function createBrowserExtension(options: BrowserExtensionOptions = {}) {
     const now = options.now ?? Date.now;
     let loaded: LoadedBrowserConfig = { config: { ...DEFAULT_BROWSER_CONFIG }, sources: [], errors: [] };
     let resolution: BinaryResolution | undefined;
-    let session: BrowserSession | undefined;
+    let manager: EngineManager | undefined;
+    let obscura: ObscuraEngine | undefined;
     let context: ExtensionContext | undefined;
     let loading: Promise<void> | undefined;
     let installing: Promise<InstallObscuraResult> | undefined;
@@ -46,7 +55,6 @@ export function createBrowserExtension(options: BrowserExtensionOptions = {}) {
     let installController: AbortController | undefined;
     let rawRegistration: string | undefined;
     const profileWarnings = new Set<string>();
-    const pendingStorage: PendingStorage = new Map();
     const updateUserConfig = async (patch: Partial<BrowserConfig>): Promise<string> => {
       const path = join(agentDir, "browser.config.json");
       let values: Record<string, unknown> = {};
@@ -70,7 +78,6 @@ export function createBrowserExtension(options: BrowserExtensionOptions = {}) {
         if (Object.hasOwn(project, key)) ctx.ui.notify(`browser: ${path} sets ${key}; the project value wins.`, "warning");
       }
     };
-    const missingHint = (message: string) => `${message} Run /browser install to download a verified release.`;
     const resolveBinary = () => (resolution = resolveObscuraBinary({ config: loaded.config, agentDir, env: options.env, pathDirs: options.pathDirs }));
     const profilePath = (name: string) => {
       if (!isValidProfileName(name)) throw new Error("Invalid profile name; use 1–64 letters, digits, underscores, dots or hyphens.");
@@ -113,13 +120,13 @@ export function createBrowserExtension(options: BrowserExtensionOptions = {}) {
       })).finally(() => {
         signal?.removeEventListener("abort", abort);
         installing = undefined; installController = undefined;
-        setStatus(session?.status().running ?? false, session?.status().pid);
+        setStatus(manager?.active()?.status().running ?? false, manager?.active()?.status().pid);
       });
       return installing;
     };
     const ensureConfig = async (ctx: ExtensionContext) => {
       if (loading) await loading;
-      if (!session) { loading = load(ctx).finally(() => { loading = undefined; }); await loading; }
+      if (!manager) { loading = load(ctx).finally(() => { loading = undefined; }); await loading; }
       context = ctx;
     };
     const ensureBinary = async (ctx: ExtensionContext, signal?: AbortSignal): Promise<string> => {
@@ -131,14 +138,14 @@ export function createBrowserExtension(options: BrowserExtensionOptions = {}) {
         ensuring = (async () => {
           if (installing) await installing;
           else {
-            if (loaded.config.autoInstall === "never" || !ctx.hasUI) throw new Error(missingHint(found.message));
+            if (loaded.config.autoInstall === "never" || !ctx.hasUI) throw new Error(found.message);
             const approved = await ctx.ui.confirm("Download obscura?", `pi-browser needs the obscura browser (v${loaded.config.version}, ~70 MB, Apache-2.0) from GitHub releases. Download to ${managedBinaryPath(agentDir, loaded.config.version)}?`);
             if (!approved) throw new Error("Obscura download declined. Run /browser install, set binaryPath or PI_BROWSER_OBSCURA_BIN, or put obscura on PATH.");
             signal?.throwIfAborted();
             await install(ctx, loaded.config.version, signal);
           }
           const installed = resolveBinary();
-          if (!installed.ok) throw new Error(missingHint(installed.message));
+          if (!installed.ok) throw new Error(installed.message);
           registerRaw();
           return installed.path;
         })().finally(() => { ensuring = undefined; });
@@ -151,68 +158,111 @@ export function createBrowserExtension(options: BrowserExtensionOptions = {}) {
     };
     const load = async (ctx: ExtensionContext) => {
       context = ctx;
-      await session?.stop();
-      pendingStorage.clear();
+      await manager?.stopAll();
       loaded = await loadBrowserConfig({ cwd: ctx.cwd, agentDir, projectTrusted: ctx.isProjectTrusted() });
       resolveBinary();
-      const profile = loaded.config.profile;
-      session = new BrowserSession({
-        config: loaded.config, resolveBinary: () => resolution!, launch: options.launch, env: options.env, now,
-        onStateChange: ({ running, pid }) => { if (!running) pendingStorage.clear(); setStatus(running, pid); },
-        ...(profile ? {
-          onAfterStart: async (call) => {
-            let state;
-            try { state = await readProfile(profile); }
-            catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return; throw error; }
-            await restoreStorageState({ call }, state, { cwd: ctx.cwd, pending: pendingStorage });
-          },
-          onBeforeStop: async (call) => {
-            await writeProfile(profile, JSON.parse(checkedText(await call("browser_storage_state", {}))));
-          },
-          onHookError: (error: unknown, phase: "restore" | "save") => {
-            const key = `${profile}/${phase}`;
-            if (!profileWarnings.has(key)) {
-              profileWarnings.add(key);
-              context?.ui.notify(`browser: profile ${profile} ${phase} failed: ${error instanceof Error ? error.message : String(error)}`, "warning");
-            }
-          },
-        } : {}),
+      obscura = new ObscuraEngine({
+        config: loaded.config, cwd: ctx.cwd, resolveBinary: async (signal) => {
+          await ensureBinary(ctx, signal);
+          return resolution!;
+        }, launch: options.launch, env: options.env, now,
+        onStateChange: ({ running }) => {
+          if (!running) manager?.engineStopped("obscura");
+          const state = manager?.active()?.status();
+          setStatus(state?.running ?? false, state?.pid);
+        },
+        onRestore: async (engine: BrowserEngine) => {
+          const profile = loaded.config.profile;
+          if (!profile) return;
+          let state;
+          try { state = await readProfile(profile); }
+          catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return; throw error; }
+          await restoreStorageState(engine, state, { cwd: ctx.cwd, pending: manager!.pendingFor("obscura") });
+        },
+        onSave: async (engine: BrowserEngine) => {
+          const profile = loaded.config.profile;
+          if (profile) await writeProfile(profile, await engine.storageState());
+        },
+        onHookError: (error: unknown, phase: "restore" | "save") => {
+          const profile = loaded.config.profile;
+          const key = `${profile}/${phase}`;
+          if (!profileWarnings.has(key)) {
+            profileWarnings.add(key);
+            context?.ui.notify(`browser: profile ${profile} ${phase} failed: ${error instanceof Error ? error.message : String(error)}`, "warning");
+          }
+        },
       });
+      manager = new EngineManager({ config: loaded.config,
+        factories: { obscura: () => obscura!, chrome: () => new ChromeEngine({ config: loaded.config, cwd: ctx.cwd, env: options.env, launch: options.launchChrome,
+          onStateChange: ({ running }) => { if (!running) manager?.engineStopped("chrome"); const state = manager?.active()?.status(); setStatus(state?.running ?? false, state?.pid); },
+        }), ...options.engineFactories },
+        availability: {
+          obscura: () => {
+            const found = resolveBinary();
+            return found.ok || (loaded.config.autoInstall === "ask" && ctx.hasUI) ? { ok: true } : { ok: false, reason: found.message };
+          },
+          chrome: () => options.launchChrome && loaded.config.chrome.enabled ? { ok: true } : chromeAvailability(loaded.config, options.env ?? process.env, { pathDirs: options.pathDirs }), ...options.engineAvailability,
+        },
+        onStateChange: () => {
+          const state = manager?.active()?.status();
+          setStatus(state?.running ?? false, state?.pid);
+        },
+      });
+      options.onManager?.(manager);
       registerTools();
-      if (loaded.config.exposure === "deferred") {
-        pi.setActiveTools(pi.getActiveTools().filter((name) => !registeredNames.has(name)));
-      }
+      updateExposure();
       for (const error of loaded.errors) ctx.ui.notify(`browser: ${error}`, "warning");
-      if (resolution && !resolution.ok) ctx.ui.notify(missingHint(resolution.message), "warning");
+      if (resolution && !resolution.ok) {
+        if (loaded.config.autoInstall === "ask") {
+          ctx.ui.notify("browser: obscura is not installed yet. Run /browser install, or accept the download prompt when a browser tool is first used.", "info");
+        } else {
+          ctx.ui.notify(`browser: obscura not found (config.binaryPath / PI_BROWSER_OBSCURA_BIN / PATH / ${managedBinaryPath(agentDir, loaded.config.version)}). Install it manually or run /browser install.`, "warning");
+        }
+      }
       registerRaw();
       setStatus(false);
     };
-    const getSession = async (ctx: ExtensionContext, needsBinary = true, signal?: AbortSignal) => {
+    const getManager = async (ctx: ExtensionContext, _signal?: AbortSignal) => {
       await ensureConfig(ctx);
-      if (needsBinary) await ensureBinary(ctx, signal);
-      return session!;
+      return manager!;
+    };
+    const getEngine = async (ctx: ExtensionContext, signal?: AbortSignal) => (await getManager(ctx, signal)).require();
+    const updateExposure = () => {
+      const active = pi.getActiveTools().filter(name => !registeredNames.has(name));
+      const direct = [...registeredNames].filter(name => toolExposure(name, loaded.config.exposure) === "direct");
+      // Pi 0.99.2 registers tool_search but explicit active filtering must retain/enable it.
+      if (direct.length < registeredNames.size && pi.getAllTools().some(t => t.name === "tool_search") && !active.includes("tool_search")) active.push("tool_search");
+      pi.setActiveTools([...active, ...direct]);
+    };
+    const refreshConfig = async (ctx: ExtensionContext) => {
+      const next = await loadBrowserConfig({ cwd: ctx.cwd, agentDir, projectTrusted: ctx.isProjectTrusted() });
+      Object.assign(loaded.config, next.config);
+      loaded = { ...next, config: loaded.config };
+      resolveBinary(); registerTools(); updateExposure(); registerRaw();
+      for (const error of loaded.errors) ctx.ui.notify(`browser: ${error}`, "warning");
     };
     const result = async (tool: string, start: number, content: McpContent[]) => {
       const bounded = await mcpContentToToolContent(content, { maxChars: loaded.config.maxOutputChars, label: tool });
       return { content: bounded.content, details: { tool, durationMs: Math.max(0, now() - start), ...(bounded.spilledPath ? { spilledPath: bounded.spilledPath } : {}) } };
     };
     const registerTools = () => {
-      const common = { exposure: loaded.config.exposure, executionMode: "sequential" as const, promptGuidelines: [REF_GUIDELINE] };
+      const common = { exposure: toolExposure("browser_navigate", loaded.config.exposure), executionMode: "sequential" as const, promptGuidelines: [REF_GUIDELINE, ...(deferredToolGuideline(loaded.config.exposure) && loaded.config.exposure !== "deferred" ? [deferredToolGuideline(loaded.config.exposure)] : [])] };
       const register = <T extends TSchema>(tool: ToolDefinition<T>) => { registeredNames.add(tool.name); pi.registerTool(tool); };
-      for (const name of registerInteractionTools(pi, { config: () => loaded.config, getSession: (ctx, signal) => getSession(ctx, true, signal), now, guideline: REF_GUIDELINE, pendingStorage })) registeredNames.add(name);
+      for (const name of registerInteractionTools(pi, { config: () => loaded.config, getManager, now, guideline: REF_GUIDELINE })) registeredNames.add(name);
       registeredNames.add(registerFetchTool(pi, { getConfig: () => loaded.config, ensureBinary, env: options.env, launchFetch: options.launchFetch, killGraceMs: options.fetchKillGraceMs ?? 10_000, guideline: REF_GUIDELINE }));
       register({
-        ...common, name: "browser_navigate", label: "Browser navigate", description: "Open an HTTP(S) page and return its text and current interactive refs.",
+        ...common, name: "browser_navigate", label: "Browser navigate", description: 'Open an HTTP(S) page and return its text and current interactive refs. engine: "chrome" for the app under development or fidelity-sensitive pages; "obscura" (default for public pages) for light reading.',
         promptSnippet: "Open a web page and inspect its current interactive refs.", annotations: { openWorldHint: true, readOnlyHint: false },
-        parameters: Type.Object({ url: Type.String({ minLength: 1 }), waitUntil: Type.Optional(Type.Union([Type.Literal("load"), Type.Literal("domcontentloaded"), Type.Literal("networkidle0")])) }),
+        parameters: Type.Object({ url: Type.String({ minLength: 1 }), engine: Type.Optional(Type.Union([Type.Literal("obscura"), Type.Literal("chrome")])), waitUntil: Type.Optional(Type.Union([Type.Literal("load"), Type.Literal("domcontentloaded"), Type.Literal("networkidle0")])) }),
         async execute(_id, params, signal, _update, ctx) {
           const start = now();
           let url: URL;
           try { url = new URL(params.url); } catch { throw new Error("browser_navigate requires a valid http: or https: URL."); }
           if (!["http:", "https:"].includes(url.protocol)) throw new Error("browser_navigate supports only http: and https: URLs; other schemes are not allowed.");
-          const browser = await getSession(ctx, true, signal);
-          checkedText(await browser.call("browser_navigate", { url: params.url, ...(params.waitUntil ? { waitUntil: params.waitUntil } : {}) }, { signal }), ctx.cwd);
-          const applied = await applyPendingStorage(browser, pendingStorage, { signal });
+          const manager = await getManager(ctx, signal);
+          const browser = await manager.select({ engine: params.engine, url: params.url });
+          await browser.navigate(params.url, { waitUntil: params.waitUntil, signal });
+          const applied = await applyPendingStorage(browser, manager.pendingFor(browser.name), { signal });
           const text = await summarizePage(browser, { maxChars: loaded.config.maxOutputChars, signal });
           return result("browser_navigate", start, [{ type: "text", text: applied ? `${text}\n${applied}` : text }]);
         },
@@ -223,7 +273,7 @@ export function createBrowserExtension(options: BrowserExtensionOptions = {}) {
         parameters: Type.Object({ maxChars: Type.Optional(Type.Integer({ minimum: 1, maximum: 2147483647 })), interactive: Type.Optional(Type.Boolean()), limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 2147483647 })) }),
         async execute(_id, params, signal, _update, ctx) {
           const start = now();
-          const text = await summarizePage(await getSession(ctx, true, signal), { maxChars: params.maxChars ?? loaded.config.maxOutputChars, includeInteractive: params.interactive, limit: params.limit, signal });
+          const text = await summarizePage(await getEngine(ctx, signal), { maxChars: params.maxChars ?? loaded.config.maxOutputChars, includeInteractive: params.interactive, limit: params.limit, signal });
           return result("browser_snapshot", start, [{ type: "text", text }]);
         },
       });
@@ -233,7 +283,7 @@ export function createBrowserExtension(options: BrowserExtensionOptions = {}) {
         parameters: Type.Object({ expression: Type.String({ minLength: 1 }) }),
         async execute(_id, params, signal, _update, ctx) {
           const start = now();
-          const raw = checkedText(await (await getSession(ctx, true, signal)).call("browser_evaluate", { expression: wrapExpression(params.expression) }, { signal, deadlineMs: loaded.config.evaluateTimeoutMs }));
+          const raw = await (await getEngine(ctx, signal)).evaluate(wrapExpression(params.expression), signal);
           return result("browser_evaluate", start, [{ type: "text", text: decodeEvaluation(raw) }]);
         },
       });
@@ -245,16 +295,23 @@ export function createBrowserExtension(options: BrowserExtensionOptions = {}) {
         const command = args.trim();
         const installMatch = /^install(?:\s+(\d+\.\d+\.\d+(?:-[\w.-]+)?))?$/.exec(command);
         const networkMatch = /^allow-private-network\s+(on|off)$/.exec(command);
+        const engineMatch = /^engine(?:\s+(obscura|chrome))?$/.exec(command);
         const profileMatch = /^profile\s+(save|load|clear)(?:\s+(\S+))?$/.exec(command);
-        if (!["status", "stop", "restart"].includes(command) && !installMatch && !networkMatch && !profileMatch) {
+        if (!["status", "stop", "restart"].includes(command) && !installMatch && !networkMatch && !profileMatch && !engineMatch) {
           ctx.ui.notify(BROWSER_USAGE, "warning"); return;
         }
         try {
-          const browser = await getSession(ctx, false);
-          if (command === "stop") { await browser.stop(); pendingStorage.clear(); ctx.ui.notify("browser: stopped (tabs lost)", "info"); return; }
+          const manager = await getManager(ctx);
+          const browser = manager.active() ?? obscura!;
+          if (engineMatch) {
+            if (engineMatch[1]) await manager.switchTo(engineMatch[1] as EngineName);
+            const status = manager.status();
+            ctx.ui.notify(`browser: active engine: ${status.active ?? "none"}; default engine: ${status.default}`, "info"); return;
+          }
+          if (command === "stop") { await manager.stopAll(); ctx.ui.notify("browser: stopped (tabs lost)", "info"); return; }
           if (installMatch) {
             const version = installMatch[1] ?? loaded.config.version;
-            await browser.stop();
+            await manager.stopAll();
             const installed = await install(ctx, version);
             let savedPath: string | undefined;
             if (installMatch[1] && version !== loaded.config.version) {
@@ -267,15 +324,15 @@ export function createBrowserExtension(options: BrowserExtensionOptions = {}) {
             ctx.ui.notify(`browser: installed obscura v${installed.version}\nPath: ${installed.path}\nSize: ${installed.bytes} bytes\nSHA-256: ${installed.sha256}${savedPath ? `\nversion ${version} saved to ${savedPath}` : ""}`, "info");
             if (savedPath) await warnProjectOverride(ctx, "version");
             if (found.ok && found.source !== "cache") ctx.ui.notify(`Installed to ${installed.path}, but binary resolution currently uses ${found.source}: ${found.path}. Remove binaryPath / PI_BROWSER_OBSCURA_BIN / the PATH entry to use the managed binary.`, "warning");
-            else if (!found.ok) ctx.ui.notify(missingHint(found.message), "warning");
+            else if (!found.ok) ctx.ui.notify(found.message, "warning");
             return;
           }
           if (networkMatch) {
             await updateUserConfig({ allowPrivateNetwork: networkMatch[1] === "on" });
             const wasRunning = browser.status().running;
-            loading = load(ctx).finally(() => { loading = undefined; });
-            await loading;
-            if (wasRunning) { await ensureBinary(ctx); await session!.ensureStarted(); }
+            if (wasRunning) await browser.stop();
+            await refreshConfig(ctx);
+            if (wasRunning) { if (!manager.active()) await manager.select(); await manager.restartActive(); }
             ctx.ui.notify(`browser: allowPrivateNetwork ${networkMatch[1]} (user config)`, "info");
             await warnProjectOverride(ctx, "allowPrivateNetwork");
             return;
@@ -287,26 +344,29 @@ export function createBrowserExtension(options: BrowserExtensionOptions = {}) {
             let restoreText: string | undefined;
             if (action === "clear") await rm(path, { force: true });
             else {
-              await ensureBinary(ctx);
-              if (action === "save") await writeProfile(name, JSON.parse(checkedText(await browser.call("browser_storage_state", {}))));
-              else restoreText = (await restoreStorageState(browser, await readProfile(name), { signal: AbortSignal.timeout(10_000), cwd: ctx.cwd, pending: pendingStorage })).text;
+              const engine = manager.active() ?? await manager.select();
+              if (action === "save") await writeProfile(name, await engine.storageState());
+              else restoreText = (await restoreStorageState(engine, await readProfile(name), { signal: AbortSignal.timeout(10_000), cwd: ctx.cwd, pending: manager.pendingFor(engine.name) })).text;
             }
             ctx.ui.notify(`browser: profile ${name} ${action === "save" ? "saved" : action === "load" ? "loaded" : "cleared"} (${path})${restoreText ? `\n${restoreText}` : ""}`, "info");
             return;
           }
           if (command === "restart") {
-            // Track config reload too, so shutdown cannot miss a newly created session.
-            loading = load(ctx).finally(() => { loading = undefined; });
-            await loading;
-            await ensureBinary(ctx);
-            await session!.ensureStarted();
+            // Save with the old profile/settings before applying the new config.
+            await manager.active()?.stop();
+            await refreshConfig(ctx);
+            if (!manager.active()) await manager.select();
+            await manager.restartActive();
             ctx.ui.notify("browser: restarted (tabs lost)", "info");
             return;
           }
-          const state = browser.status();
+          const state = obscura!.session.status();
+          const engines = manager.status();
           resolveBinary();
           const binary = resolution?.ok ? `${resolution.path} (${resolution.source})` : resolution?.message ?? "unresolved";
-          ctx.ui.notify(`browser: ${state.running ? "running" : "idle"}\nPID: ${state.pid ?? "none"}\nBinary: ${binary}\nConfig sources: ${loaded.sources.join(", ") || "defaults"}\nConfig errors: ${loaded.errors.join("; ") || "none"}\nCalls: ${state.calls}\nautoInstall: ${loaded.config.autoInstall}\nprofile: ${loaded.config.profile ?? "none"}\nrawMcp: ${loaded.config.rawMcp}\nartifactsDir: ${loaded.config.artifactsDir ?? defaultSpillDir()}\nManaged cache: ${managedCacheDir(agentDir)}`, "info");
+          const engineStatus = Object.entries(engines.engines).map(([name, e]) =>
+            `[${name}] ${e.running ? "running" : "idle"} | Available: ${e.available ? "yes" : `no (${e.reason})`} | PID: ${e.pid ?? "none"} | Binary: ${name === "obscura" ? binary : e.binary ?? chromeAvailability(loaded.config, options.env ?? process.env).executablePath ?? e.detail}${name === "chrome" ? ` | ${e.detail} | flags: ${buildChromeArgs(loaded.config, options.env ?? process.env).join(" ")}` : ""}`).join("\n");
+          ctx.ui.notify(`browser: ${Object.values(engines.engines).some(e => e.running) ? "running" : "idle"}\nActive engine: ${engines.active ?? "none"} | Default engine: ${engines.default} (config: ${engines.configDefault})\n${engineStatus}\nChrome config: ${JSON.stringify(loaded.config.chrome)}\nPID: ${state.pid ?? "none"}\nBinary: ${binary}\nConfig sources: ${loaded.sources.join(", ") || "defaults"}\nConfig errors: ${loaded.errors.join("; ") || "none"}\nCalls: ${state.calls}\nautoInstall: ${loaded.config.autoInstall}\nprofile: ${loaded.config.profile ?? "none"}\nrawMcp: ${loaded.config.rawMcp}\nartifactsDir: ${loaded.config.artifactsDir ?? defaultSpillDir()}\nManaged cache: ${managedCacheDir(agentDir)}`, "info");
         } catch (error) { ctx.ui.notify(error instanceof Error ? error.message : String(error), "error"); }
       },
     });
@@ -319,7 +379,7 @@ export function createBrowserExtension(options: BrowserExtensionOptions = {}) {
       await installing?.catch(() => {});
       await ensuring?.catch(() => {});
       await loading;
-      await session?.stop();
+      await manager?.stopAll();
     });
   };
 }

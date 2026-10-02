@@ -1,13 +1,14 @@
+import { readFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { DEFAULT_BROWSER_CONFIG } from "../src/config.js";
-import { BrowserAbortedError, BrowserRestartedError, ObscuraMcpClient, buildChildEnv, buildObscuraArgs, obscuraGlobalArgs, type McpToolResult } from "../src/mcp-client.js";
+import { BrowserAbortedError, BrowserRestartedError, McpStdioClient, buildChildEnv, buildObscuraArgs, obscuraGlobalArgs, type McpToolResult } from "../src/mcp-client.js";
 
 const server = fileURLToPath(new URL("./helpers/fake-mcp-server.mjs", import.meta.url));
-const clients: ObscuraMcpClient[] = [];
-function client(env?: NodeJS.ProcessEnv): ObscuraMcpClient {
-  const instance = new ObscuraMcpClient({ binary: process.execPath, config: { ...DEFAULT_BROWSER_CONFIG },
+const clients: McpStdioClient[] = [];
+function client(env?: NodeJS.ProcessEnv): McpStdioClient {
+  const instance = new McpStdioClient({ label: "test-engine", command: process.execPath, args: [server], defaultDeadlineMs: DEFAULT_BROWSER_CONFIG.timeoutMs,
     launch: () => spawn(process.execPath, [server], { stdio: "pipe", env: buildChildEnv(env ?? process.env) }) });
   clients.push(instance);
   return instance;
@@ -23,7 +24,7 @@ function alive(pid: number | undefined): boolean {
 }
 afterEach(async () => { await Promise.all(clients.splice(0).map((instance) => instance.close())); });
 
-describe("ObscuraMcpClient", () => {
+describe("McpStdioClient", () => {
   it("handshakes before requests and lists tools", async () => {
     const instance = client();
     expect(instance.isRunning).toBe(false);
@@ -60,7 +61,7 @@ describe("ObscuraMcpClient", () => {
       expect(result.status).toBe("rejected");
       if (result.status === "rejected") {
         expect(result.reason).toBeInstanceOf(BrowserRestartedError);
-        expect(result.reason.message).toMatch(/browser process was terminated.*tabs were lost/);
+        expect(result.reason.message).toMatch(/test-engine process was terminated.*tabs were lost/);
       }
     }
     expect(text(await instance.callTool("echo", { fresh: true }))).toContain("fresh");
@@ -186,4 +187,38 @@ describe("ObscuraMcpClient", () => {
     expect(buildChildEnv({ PATH: "/bin", HOME: "/home", UNSET: undefined, OBSCURA_ONE: "1", OBSCURA_: "2", OTHER: "no" }))
       .toEqual({ PATH: "/bin", HOME: "/home", OBSCURA_ONE: "1", OBSCURA_: "2" });
   });
+  it("spawns the supplied command/args/environment without obscura policy and labels errors", async () => {
+    const instance = new McpStdioClient({ label: "chrome", command: process.execPath, args: [server],
+      env: { PATH: process.env.PATH, SECRET_TEST: "explicitly forwarded" }, defaultDeadlineMs: 2000 });
+    clients.push(instance);
+    expect(JSON.parse(text(await instance.callTool("env", {}))).SECRET_TEST).toBe("explicitly forwarded");
+    await expect(instance.callTool("hang", {}, { deadlineMs: 20 })).rejects.toThrow("chrome process was terminated");
+    await instance.close();
+    await expect(instance.callTool("echo", {})).rejects.toThrow("chrome MCP client is closed");
+  });
+
+  it.skipIf(process.platform !== "linux")("escalates a detached group even after the MCP parent exits", async () => {
+    const script = `import { spawn } from 'node:child_process';
+      const child = spawn(process.execPath, ['-e', "process.on('SIGTERM', () => {}); process.send('ready'); setInterval(() => {}, 1000)"], { stdio: ['ignore','ignore','ignore','ipc'] });
+      await new Promise(resolve => child.once('message', resolve));
+      process.stderr.write('DESCENDANT=' + child.pid + '\\n');
+      await import(${JSON.stringify(new URL("./helpers/fake-mcp-server.mjs", import.meta.url).href)});`;
+    const instance = new McpStdioClient({ label: "chrome", command: process.execPath,
+      args: ["--input-type=module", "-e", script], detached: true, defaultDeadlineMs: 2000 });
+    clients.push(instance);
+    await instance.initialize();
+    const parent = instance.pid;
+    const descendant = Number(/DESCENDANT=(\d+)/.exec(instance.stderrTail())?.[1]);
+    expect(descendant).toBeGreaterThan(0);
+    const started = Date.now();
+    await instance.close();
+    expect(Date.now() - started).toBeGreaterThanOrEqual(1900);
+    expect(alive(parent)).toBe(false);
+    // Orphaned killed children may briefly be zombies before the host init reaps them.
+    await expect.poll(() => {
+      try { return !/^\d+ \(.+\) Z /.test(readFileSync(`/proc/${descendant}/stat`, "utf8")); }
+      catch { return false; }
+    }, { timeout: 2000 }).toBe(false);
+  }, 6000);
+
 });

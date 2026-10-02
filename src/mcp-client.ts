@@ -1,48 +1,32 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import type { BrowserConfig } from "./config.js";
 import type { McpContent } from "./output.js";
 
 export class BrowserRestartedError extends Error {
-  constructor(reason = "The request deadline was exceeded") {
-    super(`${reason}; the browser process was terminated and open tabs were lost.`);
+  constructor(reason = "The request deadline was exceeded", label = "browser") {
+    super(`${reason}; the ${label} process was terminated and open tabs were lost.`);
     this.name = "BrowserRestartedError";
   }
 }
 
 export class BrowserAbortedError extends BrowserRestartedError {
-  constructor() {
-    super("The browser request was aborted");
+  constructor(label = "browser") {
+    super(`The ${label} request was aborted`, label);
     this.name = "BrowserAbortedError";
   }
 }
 
-/** Flags shared by the MCP server and the independent fetch CLI. */
-export function obscuraGlobalArgs(config: BrowserConfig): string[] {
-  const args: string[] = [];
-  if (config.allowPrivateNetwork) args.push("--allow-private-network");
-  if (config.stealth) args.push("--stealth");
-  if (config.proxy) args.push("--proxy", config.proxy);
-  return args;
-}
-
-export function buildObscuraArgs(config: BrowserConfig): string[] {
-  const args = ["mcp", ...obscuraGlobalArgs(config)];
-  if (config.userAgent) args.push("--user-agent", config.userAgent);
-  return args;
-}
-
-export function buildChildEnv(parentEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-  return Object.fromEntries(Object.entries(parentEnv).filter(([key, value]) =>
-    value !== undefined && (["PATH", "HOME", "TMPDIR", "TMP", "TEMP"].includes(key) || key.startsWith("OBSCURA_"))));
-}
+// Compatibility exports; obscura policy belongs to the engine, not the transport.
+export { obscuraGlobalArgs, buildObscuraArgs, buildChildEnv } from "./engines/obscura.js";
 
 export interface McpToolResult { content: McpContent[]; isError: boolean }
 export interface McpTool { name: string; description?: string; inputSchema: Record<string, unknown> }
 export interface CallOptions { deadlineMs?: number; signal?: AbortSignal }
 export interface McpClientOptions {
-  binary: string;
-  config: BrowserConfig;
-  version?: string;
+  label: string;
+  command: string;
+  args: string[];
+  defaultDeadlineMs: number;
+  detached?: boolean;
   launch?: () => ChildProcess;
   env?: NodeJS.ProcessEnv;
   onStateChange?: (state: { running: boolean; pid: number | undefined }) => void;
@@ -60,7 +44,7 @@ interface Job {
 interface Pending { id: number; resolve: (value: unknown) => void; reject: (error: Error) => void }
 
 /** A single mutable browser is shared by all requests: even the handshake is serialized. */
-export class ObscuraMcpClient {
+export class McpStdioClient {
   private child?: ChildProcess;
   private initialized = false;
   private disposed = false;
@@ -94,16 +78,16 @@ export class ObscuraMcpClient {
   }
 
   private enqueue(method: string, params: unknown, options: CallOptions): Promise<unknown> {
-    if (this.disposed) return Promise.reject(new Error("Browser MCP client is closed"));
+    if (this.disposed) return Promise.reject(new Error(`${this.options.label} MCP client is closed`));
     if (options.signal?.aborted) {
-      const error = new BrowserAbortedError();
+      const error = new BrowserAbortedError(this.options.label);
       this.failAll(error);
       void this.terminate();
       return Promise.reject(error);
     }
     return new Promise((resolve, reject) => {
       const abort = () => {
-        this.failAll(new BrowserAbortedError());
+        this.failAll(new BrowserAbortedError(this.options.label));
         void this.terminate();
       };
       const job: Job = { method, params, options, resolve, reject,
@@ -124,9 +108,9 @@ export class ObscuraMcpClient {
         let timer: NodeJS.Timeout | undefined;
         try {
           // Deadline includes initialization as well as the actual request.
-          const deadline = job.options.deadlineMs ?? this.options.config.timeoutMs;
+          const deadline = job.options.deadlineMs ?? this.options.defaultDeadlineMs;
           timer = setTimeout(() => {
-            this.failAll(new BrowserRestartedError(`Browser request exceeded ${deadline} ms`));
+            this.failAll(new BrowserRestartedError(`${this.options.label} request exceeded ${deadline} ms`, this.options.label));
             void this.terminate();
           }, deadline);
           await this.start(job);
@@ -150,11 +134,11 @@ export class ObscuraMcpClient {
     if (this.termination) await this.termination;
     if (this.child && !this.isRunning) await this.exitPromise;
     if (job.cancelled) throw job.cancelled;
-    if (this.disposed) throw new Error("Browser MCP client is closed");
+    if (this.disposed) throw new Error(`${this.options.label} MCP client is closed`);
     if (this.initialized && this.isRunning) return;
     this.stderr = Buffer.alloc(0);
-    const child = this.options.launch?.() ?? spawn(this.options.binary, buildObscuraArgs(this.options.config), {
-      stdio: ["pipe", "pipe", "pipe"], env: buildChildEnv(this.options.env ?? process.env),
+    const child = this.options.launch?.() ?? spawn(this.options.command, this.options.args, {
+      stdio: ["pipe", "pipe", "pipe"], env: this.options.env ?? process.env, detached: this.options.detached ?? false,
     });
     this.child = child;
     this.initialized = false;
@@ -178,26 +162,27 @@ export class ObscuraMcpClient {
         if (finished) return;
         finished = true;
         this.initialized = false;
-        if (!this.termination) this.failAll(new Error(`${reason}. Browser process exited; open tabs were lost.\n${this.stderrTail()}`));
+        if (!this.termination) this.failAll(new Error(`${reason}. ${this.options.label} process exited; open tabs were lost.\n${this.stderrTail()}`));
         this.options.onStateChange?.({ running: false, pid: undefined });
         resolve();
+        if (this.options.detached && !this.termination) void this.terminate();
       };
       // 'close' fires after stderr drains, so diagnostics include the last output.
-      child.once("close", (code, signal) => finish(`Obscura exited (code ${code}, signal ${signal})`));
-      child.once("error", (error) => finish(`Cannot launch obscura: ${error.message}`));
+      child.once("close", (code, signal) => finish(`${this.options.label} exited (code ${code}, signal ${signal})`));
+      child.once("error", (error) => finish(`Cannot launch ${this.options.label}: ${error.message}`));
     });
     child.stdin?.on("error", (error) => {
-      if (!this.termination) this.failAll(new Error(`Obscura stdin failed: ${error.message}\n${this.stderrTail()}`));
+      if (!this.termination) this.failAll(new Error(`${this.options.label} stdin failed: ${error.message}\n${this.stderrTail()}`));
       void this.terminate();
     });
     if (!child.stdin || !child.stdout || !child.stderr) {
       void this.terminate();
-      throw new Error("Browser launcher must provide piped stdin, stdout, and stderr");
+      throw new Error(`${this.options.label} launcher must provide piped stdin, stdout, and stderr`);
     }
     try {
       await this.request("initialize", {
         protocolVersion: "2024-11-05", capabilities: {},
-        clientInfo: { name: "pi-browser", version: this.options.version ?? "0.1.0" },
+        clientInfo: { name: "pi-browser", version: "0.1.0" },
       });
       if (job.cancelled) throw job.cancelled;
       child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" })}\n`);
@@ -245,14 +230,30 @@ export class ObscuraMcpClient {
   private terminate(): Promise<void> {
     if (this.termination) return this.termination;
     const child = this.child;
-    if (!child || child.exitCode !== null || child.signalCode !== null) return this.exitPromise;
+    if (!child || (!this.options.detached && (child.exitCode !== null || child.signalCode !== null))) return this.exitPromise;
     this.initialized = false;
     this.options.onStateChange?.({ running: false, pid: undefined });
     child.stdin?.end();
-    child.kill("SIGTERM");
-    const timer = setTimeout(() => child.kill("SIGKILL"), 2000);
-    timer.unref();
-    this.termination = this.exitPromise.finally(() => {
+    const kill = (signal: NodeJS.Signals) => {
+      try {
+        if (this.options.detached && child.pid) process.kill(-child.pid, signal);
+        else child.kill(signal);
+      } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; }
+    };
+    kill("SIGTERM");
+    let timer: NodeJS.Timeout;
+    const escalation = new Promise<void>(resolve => {
+      timer = setTimeout(() => { kill("SIGKILL"); resolve(); }, 2000);
+      timer.unref();
+    });
+    this.termination = this.exitPromise.then(async () => {
+      if (this.options.detached && child.pid) {
+        // The MCP parent can exit while Chrome descendants ignore SIGTERM. Do not
+        // cancel escalation until the whole group is gone, not merely the parent.
+        try { process.kill(-child.pid, 0); await escalation; }
+        catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; }
+      }
+    }).finally(() => {
       clearTimeout(timer);
       this.termination = undefined;
     });
@@ -262,7 +263,7 @@ export class ObscuraMcpClient {
   close(): Promise<void> {
     if (!this.closePromise) {
       this.disposed = true;
-      this.failAll(new Error("Browser process was terminated; open tabs were lost (client closed)."));
+      this.failAll(new Error(`${this.options.label} process was terminated; open tabs were lost (client closed).`));
       this.closePromise = this.terminate();
     }
     return this.closePromise;

@@ -7,7 +7,7 @@ import { createHarness, tool, type Harness } from "./helpers/harness.js";
 const open: Harness[] = [];
 afterEach(async () => { for (const h of open.splice(0)) await h.dispose(); });
 async function harness(config: Record<string, unknown> = {}) {
-  const h = await createHarness({ config: { artifactsDir: "artifacts", ...config } });
+  const h = await createHarness({ config: { exposure: "direct", artifactsDir: "artifacts", ...config } });
   open.push(h);
   return h;
 }
@@ -15,6 +15,7 @@ const results = (h: Harness) => h.session.messages.filter((message) => message.r
 type Result = ReturnType<typeof results>[number];
 const text = (result: Result) => result.content.filter((item) => item.type === "text").map((item) => item.text).join("\n");
 async function run(h: Harness, name: string, args: Record<string, unknown> = {}): Promise<Result> {
+  if (!h.manager.active()) await h.manager.select();
   const before = results(h).length;
   h.main.faux.setResponses([tool(name, args as Parameters<typeof tool>[1]), reply("done")]);
   await h.session.prompt(`Call ${name}`);
@@ -204,7 +205,7 @@ describe("interaction tools (real AgentSession, fake MCP child)", () => {
     const start = Date.now();
     const result = await run(h, "browser_wait", { selector: "#never", timeoutMs: 1 });
     expect(result.isError).toBe(true);
-    expect(text(result)).toContain("Browser request exceeded 5001 ms");
+    expect(text(result)).toContain("obscura request exceeded 5001 ms");
     expect(text(result)).toContain("open tabs were lost");
     expect(Date.now() - start).toBeGreaterThanOrEqual(4900);
     expect((await run(h, "browser_snapshot")).isError).toBe(false);
@@ -367,7 +368,7 @@ describe("extraction, tabs, and storage state", () => {
     expect(text(closed)).toBe("Closed tab-2.");
     expect(closed.details).toMatchObject({ action: "close" });
     expect(text(await run(h, "browser_tabs", { action: "close" }))).toBe("Closed tab-1.");
-    expect(text(await run(h, "browser_tabs", { action: "list" }))).toBe("No open tabs.");
+    expect(text(await run(h, "browser_tabs", { action: "list" }))).toBe("[obscura] (active)\nNo open tabs.");
   });
 
   it("roundtrips cookies and active-origin storage via a JSON file", async () => {
@@ -474,7 +475,7 @@ describe("extraction, tabs, and storage state", () => {
   it("deferred exposure removes every registered browser tool from the active set, including after reload", async () => {
     const h = await harness({ exposure: "deferred" });
     const names = h.session.getAllTools().map((item) => item.name).filter((name) => name.startsWith("browser_"));
-    expect(names).toHaveLength(16);
+    expect(names).toHaveLength(22);
     expect(names).toContain("browser_fetch");
     expect(names).toEqual(expect.arrayContaining(newTools));
     for (const name of names) {
@@ -485,5 +486,62 @@ describe("extraction, tabs, and storage state", () => {
     await h.session.prompt("/browser restart");
     expect(h.children).toHaveLength(1);
     expect(h.session.getActiveToolNames().filter((name) => name.startsWith("browser_"))).toEqual([]);
+  });
+});
+
+describe('Chrome-only tools through AgentSession', () => {
+  const chromeOnly: [string, Record<string,unknown>][] = [
+    ['browser_hover',{selector:'#go',snapshot:false}], ['browser_upload',{selector:'#file',paths:['upload.txt'],snapshot:false}],
+    ['browser_dialog',{action:'accept',promptText:'yes'}], ['browser_emulate',{cpuThrottling:4,network:'Slow 4G',viewport:'800x600'}],
+    ['browser_perf',{action:'start',reload:false,autoStop:false}], ['browser_network_request',{id:'1'}],
+  ];
+  it.each(chromeOnly)('%s on obscura fails with the chrome alternative before launching MCP',async (name,args)=> {
+    const h=await harness();
+    const result=await run(h,name,args);
+    expect(result.isError).toBe(true);
+    expect(text(result)).toContain('Not supported by the obscura engine');
+    expect(text(result)).toContain('Use engine "chrome"');
+    expect(h.children).toHaveLength(0);
+  });
+  it('executes all six tools on fake Chrome, including perf insights and native-dialog summary suppression',async ()=> {
+    const h=await createHarness({chrome:true,config:{exposure:'direct'}});open.push(h);
+    expect((await run(h,'browser_navigate',{url:'http://127.0.0.1:3000/',engine:'chrome'})).isError).toBe(false);
+    await writeFile(join(h.cwd,'upload.txt'),'upload');
+    for(const [name,args] of chromeOnly) {
+      if(name==='browser_dialog') {
+        const snapshot=text(await run(h,'browser_snapshot'));
+        await run(h,'browser_click',{ref:/^(\d+_\d+) button "Dialog"/m.exec(snapshot)![1]!,snapshot:false});
+      }
+      const result=await run(h,name,args);expect(text(result)).not.toContain(summaryMarker);expect(result.isError,text(result)).toBe(false);
+    }
+    expect((await run(h,'browser_perf',{action:'stop'})).isError).toBe(false);
+    expect(text(await run(h,'browser_perf',{action:'insight',insightName:'LCPBreakdown'}))).toContain('LCPBreakdown');
+    expect(text(await run(h,'browser_network_request',{url:'http://127.0.0.1:3000/'}))).toContain('Response Body');
+    const summary=text(await run(h,'browser_snapshot'));
+    const ref=/^(\d+_\d+) button "Dialog"/m.exec(summary)![1]!;
+    const click=await run(h,'browser_click',{ref});
+    expect(text(click)).toContain('Use browser_dialog before requesting a snapshot');
+    expect(text(click)).not.toContain(summaryMarker);
+    expect((await run(h,'browser_dialog',{action:'dismiss'})).isError).toBe(false);
+    expect(text(await run(h,'browser_hover',{selector:'#go'}))).toContain(summaryMarker);
+    expect(text(await run(h,'browser_upload',{selector:'#file',paths:['upload.txt']}))).toContain(summaryMarker);
+    expect((await run(h,'browser_upload',{selector:'#file',paths:['missing']})).isError).toBe(true);
+    expect((await run(h,'browser_network_request',{})).isError).toBe(true);
+    expect((await run(h,'browser_network_request',{id:'1',url:'http://127.0.0.1:3000/'})).isError).toBe(true);
+    expect((await run(h,'browser_perf',{action:'insight'})).isError).toBe(true);
+  });
+  it('imports Chrome storage, skips cookies/export, resets without cookie calls, and keeps engine queues separate',async ()=> {
+    const h=await createHarness({chrome:true,config:{exposure:'direct'}});open.push(h);
+    await run(h,'browser_navigate',{url:'http://127.0.0.1:3000/',engine:'chrome'});
+    await writeFile(join(h.cwd,'chrome-state.json'),JSON.stringify({cookies:[{name:'skip',domain:'127.0.0.1',value:'secret'}],origins:[{origin:'http://127.0.0.1:3000',localStorage:[['k','v']],sessionStorage:[['s','1']]}]}));
+    const imported=await run(h,'browser_state',{action:'import',path:'chrome-state.json'});
+    expect(imported.isError).toBe(false);expect(text(imported)).toContain('cookies skipped on chrome');expect(imported.details).toMatchObject({cookies:0,storageApplied:2});
+    expect(JSON.parse(text(await run(h,'browser_evaluate',{expression:'[localStorage.getItem("k"),sessionStorage.getItem("s")]'}))).value).toEqual(['v','1']);
+    for(const action of ['cookies','clear_cookies','export']) {const result=await run(h,'browser_state',{action});expect(result.isError).toBe(true);expect(text(result)).toContain('Use engine "obscura"');}
+    const previousPid=h.manager.require().status().pid;
+    h.manager.pendingFor('obscura').set('https://other.example',{localStorage:[['keep','yes']],sessionStorage:[]});
+    const reset=await run(h,'browser_state',{action:'reset'});expect(reset.isError).toBe(false);expect(text(reset)).toContain('cookies skipped on chrome');
+    expect(h.manager.require().status().pid).not.toBe(previousPid);expect(h.manager.pendingFor('obscura').size).toBe(1);
+    expect(text(await run(h,'browser_tabs',{action:'list'}))).not.toContain('127.0.0.1:3000');
   });
 });

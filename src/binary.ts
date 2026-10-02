@@ -58,7 +58,8 @@ export function resolveObscuraBinary(options: {
     message: "Obscura executable not found. Provide it by setting binaryPath in browser.config.json, "
       + "setting PI_BROWSER_OBSCURA_BIN, or placing obscura on PATH. "
       + `The managed cache was also checked (${candidates.at(-1)?.path}). `
-      + "No binary is bundled with pi-browser.",
+      + "No binary is bundled with pi-browser. "
+      + `Run /browser install to download the pinned release v${options.config.version}, or set autoInstall to "ask" to be prompted on first use.`,
   };
 }
 

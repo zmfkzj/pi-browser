@@ -13,6 +13,8 @@ import { decodeEvaluation, wrapExpression } from "../src/extension/index.js";
 import { registerInteractionTools } from "../src/extension/tools.js";
 import { checkedText, contentText, summarizePage } from "../src/page.js";
 import { BrowserSession } from "../src/session.js";
+import { ObscuraEngine, buildObscuraArgs } from "../src/engines/obscura.js";
+import { EngineManager, chromeUnavailable } from "../src/manager.js";
 
 const binary = "/tmp/obscura-investigation-bin/obscura";
 let binaryAvailable = false;
@@ -45,7 +47,10 @@ describe.skipIf(!binaryAvailable)("obscura v0.2.3 real-binary E2E", () => {
     const url = `http://127.0.0.1:${address.port}/`;
     const cwd = await mkdtemp(join(tmpdir(), "browser-e2e-"));
     const config = { ...DEFAULT_BROWSER_CONFIG, artifactsDir: "artifacts", allowPrivateNetwork: true, evaluateTimeoutMs: 2000 };
-    const session = new BrowserSession({ binary, source: "config", config });
+    const session = new BrowserSession({ binary, source: "config", config, label: "obscura", args: buildObscuraArgs(config), deadlines: { browser_evaluate: config.evaluateTimeoutMs } });
+    const engine = new ObscuraEngine({ config, session });
+    const manager = new EngineManager({ config, factories: { obscura: () => engine }, availability: { obscura: () => ({ ok: true }), chrome: chromeUnavailable } });
+    await manager.select();
     const observed = new Map<string, string>();
     const originalCall = session.call.bind(session);
     session.call = async (name, args, options) => {
@@ -55,7 +60,7 @@ describe.skipIf(!binaryAvailable)("obscura v0.2.3 real-binary E2E", () => {
     };
     const tools = new Map<string, ToolDefinition>();
     registerInteractionTools({ registerTool: (definition: ToolDefinition) => { tools.set(definition.name, definition); } } as ExtensionAPI, {
-      config: () => config, getSession: async () => session, now: Date.now, guideline: "Use current refs.",
+      config: () => config, getManager: async () => manager, now: Date.now, guideline: "Use current refs.",
     });
     const ctx = { cwd } as ExtensionToolContext;
     const run = async (name: string, args: Record<string, unknown> = {}) => tools.get(name)!.execute("e2e", args, undefined, undefined, ctx);
@@ -68,7 +73,7 @@ describe.skipIf(!binaryAvailable)("obscura v0.2.3 real-binary E2E", () => {
       checkedText(await session.call("browser_navigate", { url }));
       const rawSnapshot = checkedText(await session.call("browser_snapshot", { max_chars: 4000 }));
       const rawListing = checkedText(await session.call("browser_interactive_elements", { limit: 60 }));
-      const summary = await summarizePage(session, { maxChars: 4000 });
+      const summary = await summarizePage(engine, { maxChars: 4000 });
       expect(summary).toContain("Pi Browser Fixture");
       // Obscura uses the name attribute as the label here, not the associated <label> text.
       expect(summary).toMatch(/e1\s+input(?:\[text\])?\s+/);
@@ -152,10 +157,10 @@ describe.skipIf(!binaryAvailable)("obscura v0.2.3 real-binary E2E", () => {
       expect(checkedText(await session.call("browser_evaluate", { expression: "document.title" }))).toBe("Pi Browser Fixture");
       expect(checkedText(await session.call("browser_evaluate", { expression: "(() => { throw new Error('failure'); })()" }))).toBe("null");
       const oldPid = session.status().pid!;
-      await expect(session.call("browser_evaluate", { expression: wrapExpression("(() => { while (true) {} })()") })).rejects.toThrow(/browser process was terminated.*tabs.*lost/i);
+      await expect(session.call("browser_evaluate", { expression: wrapExpression("(() => { while (true) {} })()") })).rejects.toThrow(/obscura process was terminated.*tabs.*lost/i);
       await expect.poll(() => alive(oldPid), { timeout: 4000 }).toBe(false);
       checkedText(await session.call("browser_navigate", { url }));
-      expect(await summarizePage(session, { maxChars: 4000 })).toContain("Pi Browser Fixture");
+      expect(await summarizePage(engine, { maxChars: 4000 })).toContain("Pi Browser Fixture");
       const pid = session.status().pid!;
       expect(pid).not.toBe(oldPid);
       await session.stop();
@@ -181,7 +186,7 @@ describe.skipIf(!binaryAvailable)("obscura v0.2.3 real-binary E2E", () => {
     const origin = new URL(url).origin;
     let h: Harness | undefined;
     try {
-      h = await createHarness({ config: { binaryPath: binary, allowPrivateNetwork: true, autoInstall: "never" },
+      h = await createHarness({ config: { engine: "obscura", exposure: "direct", binaryPath: binary, allowPrivateNetwork: true, autoInstall: "never" },
         extension: { launch: undefined, install: async () => { throw new Error("Real installer must never run in E2E"); } } });
       const run = async (name: string, args: Parameters<typeof tool>[1] = {}) => {
         h!.main.faux.setResponses([tool(name, args), reply("done")]);
@@ -246,7 +251,7 @@ describe.skipIf(!binaryAvailable)("obscura v0.2.3 real-binary E2E", () => {
     let h: Harness | undefined;
     const start = Date.now();
     try {
-      h = await createHarness({ config: { binaryPath: binary, allowPrivateNetwork: true, autoInstall: "never" },
+      h = await createHarness({ config: { exposure: "direct", binaryPath: binary, allowPrivateNetwork: true, autoInstall: "never" },
         extension: { launch: undefined, install: async () => { throw new Error("Real installer must never run in E2E"); } } });
       const results = () => h!.session.messages.filter((message) => message.role === "toolResult");
       const fetch = async (args: Parameters<typeof tool>[1]) => {

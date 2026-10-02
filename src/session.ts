@@ -1,13 +1,20 @@
 import type { ChildProcess } from "node:child_process";
 import type { BinaryResolution, BinarySource } from "./binary.js";
 import type { BrowserConfig } from "./config.js";
-import { ObscuraMcpClient, type CallOptions, type McpToolResult } from "./mcp-client.js";
+import { McpStdioClient, type CallOptions, type McpToolResult } from "./mcp-client.js";
 
 export type SessionHookCall = (tool: string, args: Record<string, unknown>) => Promise<McpToolResult>;
 
 export interface BrowserSessionOptions {
-  config: BrowserConfig;
-  resolveBinary?: () => BinaryResolution | Promise<BinaryResolution>;
+  config?: BrowserConfig;
+  label?: string;
+  command?: string;
+  args?: string[];
+  defaultDeadlineMs?: number;
+  deadlines?: Record<string, number>;
+  idleMs?: number;
+  detached?: boolean;
+  resolveBinary?: (signal?: AbortSignal) => BinaryResolution | Promise<BinaryResolution>;
   binary?: string;
   source?: BinarySource;
   launch?: () => ChildProcess;
@@ -30,9 +37,9 @@ export interface BrowserStatus {
 }
 
 export class BrowserSession {
-  private client?: ObscuraMcpClient;
+  private client?: McpStdioClient;
   private starting?: Promise<void>;
-  private preparing?: Promise<ObscuraMcpClient>;
+  private preparing?: Promise<McpStdioClient>;
   private stopping?: Promise<void>;
   private idleTimer?: NodeJS.Timeout;
   private binary?: string;
@@ -44,7 +51,7 @@ export class BrowserSession {
   private restoring?: Promise<void>;
 
   constructor(private readonly options: BrowserSessionOptions) {
-    this.binary = options.binary;
+    this.binary = options.command ?? options.binary;
     this.source = options.source;
   }
 
@@ -60,7 +67,7 @@ export class BrowserSession {
     if (this.activeCalls === 0 && client.isRunning) this.armIdle();
   }
 
-  private async runHook(client: ObscuraMcpClient, phase: "restore" | "save"): Promise<void> {
+  private async runHook(client: McpStdioClient, phase: "restore" | "save"): Promise<void> {
     const hook = phase === "restore" ? this.options.onAfterStart : this.options.onBeforeStop;
     if (!hook) return;
     const deadlineMs = phase === "restore" ? 10_000 : 5_000;
@@ -76,7 +83,7 @@ export class BrowserSession {
     } finally { if (timer) clearTimeout(timer); }
   }
 
-  private async initialize(client: ObscuraMcpClient, options: CallOptions = {}): Promise<void> {
+  private async initialize(client: McpStdioClient, options: CallOptions = {}): Promise<void> {
     await client.initialize(options);
     if (this.readyPid === client.pid) return;
     if (!this.restoring) {
@@ -86,23 +93,25 @@ export class BrowserSession {
     await this.restoring;
   }
 
-  private getClient(): Promise<ObscuraMcpClient> {
-    if (this.stopping) return this.stopping.then(() => this.getClient());
+  private getClient(signal?: AbortSignal): Promise<McpStdioClient> {
+    if (this.stopping) return this.stopping.then(() => this.getClient(signal));
     if (this.preparing) return this.preparing;
     if (this.client) return Promise.resolve(this.client);
-    this.preparing = this.prepare().finally(() => { this.preparing = undefined; });
+    this.preparing = this.prepare(signal).finally(() => { this.preparing = undefined; });
     return this.preparing;
   }
 
-  private async prepare(): Promise<ObscuraMcpClient> {
-    const resolution = this.options.resolveBinary ? await this.options.resolveBinary() :
+  private async prepare(signal?: AbortSignal): Promise<McpStdioClient> {
+    const resolution = this.options.resolveBinary ? await this.options.resolveBinary(signal) :
       this.binary ? { ok: true as const, path: this.binary, source: this.source ?? "config" as const } :
-        { ok: false as const, message: "Obscura executable not found. Configure binaryPath or PI_BROWSER_OBSCURA_BIN, put obscura on PATH, or run /browser install." };
+        { ok: false as const, message: `${this.options.label ?? "browser"} executable not found. Configure its command.` };
     if (!resolution.ok) throw new Error(resolution.message);
     this.binary = resolution.path;
     this.source = resolution.source;
-    this.client = new ObscuraMcpClient({
-      binary: resolution.path, config: this.options.config, launch: this.options.launch, env: this.options.env,
+    this.client = new McpStdioClient({
+      label: this.options.label ?? "browser", command: resolution.path, args: this.options.args ?? [],
+      defaultDeadlineMs: this.options.defaultDeadlineMs ?? this.options.config?.timeoutMs ?? 45000,
+      detached: this.options.detached, launch: this.options.launch, env: this.options.env,
       onStateChange: (state) => {
         if (state.running) {
           this.startedAt = (this.options.now ?? Date.now)();
@@ -118,10 +127,10 @@ export class BrowserSession {
     this.activeCalls++;
     this.clearIdle();
     try {
-      const client = await this.getClient();
+      const client = await this.getClient(options.signal);
       const callOptions = {
         ...options,
-        deadlineMs: options.deadlineMs ?? (tool === "browser_evaluate" ? this.options.config.evaluateTimeoutMs : this.options.config.timeoutMs),
+        deadlineMs: options.deadlineMs ?? this.options.deadlines?.[tool] ?? this.options.defaultDeadlineMs ?? this.options.config?.timeoutMs ?? 45000,
       };
       // Retain the MCP client's queued handshake/deadline behavior when no restore is needed.
       if (this.options.onAfterStart) await this.initialize(client, callOptions);
@@ -140,9 +149,12 @@ export class BrowserSession {
 
   private armIdle(): void {
     this.clearIdle();
-    this.idleTimer = setTimeout(() => { void this.stop(); }, this.options.config.idleMs);
+    this.idleTimer = setTimeout(() => { void this.stop(); }, this.options.idleMs ?? this.options.config?.idleMs ?? 600000);
     this.idleTimer.unref();
   }
+
+  /** Launch settings apply to the next process; never mutate a running transport. */
+  configure(patch: Pick<BrowserSessionOptions, "args" | "defaultDeadlineMs" | "deadlines" | "idleMs">): void { Object.assign(this.options, patch); }
 
   async restart(): Promise<void> { await this.stop(); await this.ensureStarted(); }
 

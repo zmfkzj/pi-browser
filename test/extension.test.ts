@@ -4,17 +4,21 @@ import { afterEach, describe, expect, it } from "vitest";
 import { fauxAssistantMessage as reply } from "@earendil-works/pi-ai";
 import { BROWSER_USAGE, decodeEvaluation } from "../src/extension/index.js";
 import { summarizePage } from "../src/page.js";
+import { ObscuraEngine } from "../src/engines/obscura.js";
+import { DEFAULT_BROWSER_CONFIG } from "../src/config.js";
+import type { BrowserSession } from "../src/session.js";
 import { createHarness, tool, type Harness } from "./helpers/harness.js";
 
 const open: Harness[] = [];
 afterEach(async () => { for (const h of open.splice(0)) await h.dispose(); });
 async function harness(options: Parameters<typeof createHarness>[0] = {}) {
-  const h = await createHarness(options); open.push(h); return h;
+  const h = await createHarness({ ...options, config: { exposure: "direct", ...options.config } }); open.push(h); return h;
 }
 const results = (h: Harness) => h.session.messages.filter((message) => message.role === "toolResult");
 const resultText = (h: Harness) => results(h).map((message) => message.content.filter((item) => item.type === "text").map((item) => item.text).join("\n")).join("\n");
 const lastText = (h: Harness) => results(h).at(-1)!.content.filter((item) => item.type === "text").map((item) => item.text).join("\n");
 async function run(h: Harness, name: string, args: Parameters<typeof tool>[1] = {}) {
+  if (!h.manager.active()) await h.manager.select();
   h.main.faux.setResponses([tool(name, args), reply("done")]);
   await h.session.prompt(`Call ${name}`);
   expect(results(h).at(-1)?.isError).toBe(false);
@@ -31,6 +35,48 @@ async function writeState(h: Harness) {
 function alive(pid: number): boolean { try { process.kill(pid, 0); return true; } catch { return false; } }
 
 describe("browser extension (real AgentSession, faux provider)", () => {
+  it.each(["ask", "never"] as const)("shows exactly one short startup notice for autoInstall %s when obscura is missing", async (autoInstall) => {
+    const version = "0.2.4";
+    const h = await harness({
+      config: { autoInstall, version, binaryPath: "/nonexistent/pi-browser/obscura" },
+      extension: { env: {}, pathDirs: [] },
+    });
+    expect(h.notifications).toEqual([{
+      message: autoInstall === "ask"
+        ? "browser: obscura is not installed yet. Run /browser install, or accept the download prompt when a browser tool is first used."
+        : `browser: obscura not found (config.binaryPath / PI_BROWSER_OBSCURA_BIN / PATH / ${join(h.agentDir, "pi-browser", "obscura", version, process.platform === "win32" ? "obscura.exe" : "obscura")}). Install it manually or run /browser install.`,
+      type: autoInstall === "ask" ? "info" : "warning",
+    }]);
+    expect(h.confirmations).toEqual([]);
+    expect(h.children).toHaveLength(0);
+  });
+
+  it.each(["ask", "never"] as const)("does not notify at startup when obscura resolves with autoInstall %s", async (autoInstall) => {
+    const h = await harness({
+      config: { autoInstall, binaryPath: process.execPath },
+      extension: { env: {}, pathDirs: [] },
+    });
+    expect(h.notifications).toEqual([]);
+    expect(h.children).toHaveLength(0);
+  });
+
+  it.each(["browser_navigate", "browser_fetch"])("keeps full missing-binary diagnostics for %s errors", async (name) => {
+    const h = await harness({
+      config: { autoInstall: "never", binaryPath: "/nonexistent/pi-browser/obscura" },
+      extension: { env: {}, pathDirs: [] },
+      steps: [tool(name, { url: "https://example.com" }), reply("done")],
+    });
+    await h.session.prompt("Open the page");
+    expect(results(h)[0]?.isError).toBe(true);
+    expect(resultText(h)).toContain("Obscura executable not found");
+    expect(resultText(h)).toContain("PI_BROWSER_OBSCURA_BIN");
+    expect(resultText(h)).toContain("The managed cache was also checked");
+    expect(resultText(h)).toContain('Run /browser install to download the pinned release v0.2.3, or set autoInstall to "ask" to be prompted on first use.');
+    expect(h.children).toHaveLength(0);
+    expect(h.confirmations).toEqual([]);
+  });
+
+
   it("registers core active tools without launching, including safety annotations and guidelines", async () => {
     const h = await harness();
     expect(h.children).toHaveLength(0);
@@ -76,6 +122,7 @@ describe("browser extension (real AgentSession, faux provider)", () => {
     ["let x = 1;", true, "single expression or an IIFE"],
   ])("maps evaluation %s (error=%s)", async (expression, isError, expected) => {
     const h = await harness({ steps: [tool("browser_evaluate", { expression }), reply("done")] });
+    await h.manager.select();
     await h.session.prompt("Evaluate");
     expect(results(h)[0]?.isError).toBe(isError);
     expect(resultText(h)).toContain(expected);
@@ -99,6 +146,7 @@ describe("browser extension (real AgentSession, faux provider)", () => {
 
   it("bounds output, records the spill path, and supports snapshot without interactive refs", async () => {
     const h = await harness({ config: { maxOutputChars: 100 }, steps: [tool("browser_snapshot", { maxChars: 4000, interactive: false }), reply("done")] });
+    if (!h.notifications.some(n => n.message.includes("unknown key"))) await h.manager.select();
     await h.session.prompt("Read");
     const details = results(h)[0]?.details as { spilledPath: string };
     const full = await readFile(details.spilledPath, "utf8");
@@ -181,9 +229,10 @@ describe("browser extension (real AgentSession, faux provider)", () => {
 
 
   it("warns about invalid config and absent binary but leaves tools registered", async () => {
-    const h = await harness({ config: { mystery: true }, extension: { env: {}, pathDirs: [] }, steps: [tool("browser_snapshot", {}), reply("done")] });
+    const h = await harness({ config: { mystery: true }, extension: { env: {}, pathDirs: [] }, steps: [tool("browser_navigate", { url: "https://example.com" }), reply("done")] });
     expect(h.notifications.some((note) => note.message.includes("unknown key"))).toBe(true);
     expect(h.notifications.some((note) => note.message.includes("/browser install"))).toBe(true);
+    if (!h.notifications.some(n => n.message.includes("unknown key"))) await h.manager.select();
     await h.session.prompt("Read");
     expect(results(h)[0]?.isError).toBe(true);
     expect(resultText(h)).toContain("PI_BROWSER_OBSCURA_BIN");
@@ -194,10 +243,10 @@ describe("browser extension (real AgentSession, faux provider)", () => {
 describe("page parsing and evaluation defenses", () => {
   it("calls snapshot first and listing last, preserving unknown formats", async () => {
     const order: string[] = [];
-    const summary = await summarizePage({ async call(name) {
+    const summary = await summarizePage(new ObscuraEngine({ config: DEFAULT_BROWSER_CONFIG, session: { async call(name: string) {
       order.push(name);
       return { content: [{ type: "text", text: name === "browser_snapshot" ? "Unknown raw format" : 'ref=e1    input[text]            "Name" name="n"' }], isError: false };
-    } }, { maxChars: 4000 });
+    } } as unknown as BrowserSession }), { maxChars: 4000 });
     expect(order).toEqual(["browser_snapshot", "browser_interactive_elements"]);
     expect(summary).toContain("Unknown raw format");
     expect(summary).toContain('e1 input[text] "Name" name="n"');

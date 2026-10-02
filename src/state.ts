@@ -1,6 +1,7 @@
 import { storageState } from "./actions.js";
 import { decodeEvaluation, wrapExpression } from "./evaluate.js";
-import { checkedText, type PageSession } from "./page.js";
+import type { BrowserEngine } from "./engine.js";
+export type StorageEngine = Pick<BrowserEngine, "evaluate" | "setStorageState">;
 
 export interface OriginStorage {
   origin: string;
@@ -33,18 +34,18 @@ export function validateRestorableState(value: unknown): RestorableState {
   return state as RestorableState;
 }
 
-async function evaluate(session: PageSession, expression: string, signal?: AbortSignal, cwd?: string): Promise<unknown> {
-  const raw = checkedText(await session.call("browser_evaluate", { expression: wrapExpression(expression) }, { signal }), cwd);
+async function evaluate(session: StorageEngine, expression: string, signal?: AbortSignal, _cwd?: string): Promise<unknown> {
+  const raw = await session.evaluate(wrapExpression(expression), signal);
   return JSON.parse(decodeEvaluation(raw)).value;
 }
 
-async function activeOrigin(session: PageSession, signal?: AbortSignal, cwd?: string): Promise<string> {
+async function activeOrigin(session: StorageEngine, signal?: AbortSignal, cwd?: string): Promise<string> {
   const origin = await evaluate(session, "location.origin", signal, cwd);
   if (typeof origin !== "string") throw new Error("Browser evaluation did not return a string for location.origin.");
   return origin;
 }
 
-async function applyStorage(session: PageSession, entries: StorageEntries, signal?: AbortSignal, cwd?: string): Promise<number> {
+async function applyStorage(session: StorageEngine, entries: StorageEntries, signal?: AbortSignal, cwd?: string): Promise<number> {
   // Only JSON literals are embedded; quotes, newlines, and script-like values stay data.
   const expression = `(() => { const data = ${JSON.stringify(entries)}; for (const [k, v] of data.localStorage) localStorage.setItem(k, v); for (const [k, v] of data.sessionStorage) sessionStorage.setItem(k, v); return { localStorage: data.localStorage.length, sessionStorage: data.sessionStorage.length }; })()`;
   const result = await evaluate(session, expression, signal, cwd);
@@ -52,14 +53,15 @@ async function applyStorage(session: PageSession, entries: StorageEntries, signa
   return entries.localStorage.length + entries.sessionStorage.length;
 }
 
-/** Obscura v0.2.3 restores cookies; wrapped evaluations restore origin storage safely. */
-export async function restoreStorageState(session: PageSession, value: unknown, options: {
+/** Engines restore cookies; wrapped evaluations restore origin storage safely. */
+export async function restoreStorageState(session: StorageEngine, value: unknown, options: {
   signal?: AbortSignal;
   cwd?: string;
   pending: PendingStorage;
 }): Promise<StorageRestoreReport> {
   const state = validateRestorableState(value);
-  checkedText(await session.call("browser_set_storage_state", { state }, { signal: options.signal }), options.cwd);
+  const restoreText = await session.setStorageState(state, options.signal);
+  const cookiesSkipped = /cookies skipped on chrome/i.test(restoreText);
   const origin = await activeOrigin(session, options.signal, options.cwd);
   let storageApplied = 0;
   const queued = new Set<string>();
@@ -78,11 +80,12 @@ export async function restoreStorageState(session: PageSession, value: unknown, 
     }
   }
   const storageOrigin = origin === "null" ? null : origin;
-  const text = `Restored ${state.cookies.length} cookies; applied ${storageApplied} storage entries${storageOrigin ? ` to ${storageOrigin}` : " (no active non-opaque origin)"}${queued.size ? `; queued storage for ${queued.size} other origin${queued.size === 1 ? "" : "s"} (applied on the next navigation there)` : ""}.`;
-  return { cookies: state.cookies.length, storageApplied, storageOrigin, queuedOrigins: [...queued], text };
+  const cookies = cookiesSkipped ? 0 : state.cookies.length;
+  const text = `${cookiesSkipped ? `${restoreText};` : `Restored ${cookies} cookies;`} applied ${storageApplied} storage entries${storageOrigin ? ` to ${storageOrigin}` : " (no active non-opaque origin)"}${queued.size ? `; queued storage for ${queued.size} other origin${queued.size === 1 ? "" : "s"} (applied on the next navigation there)` : ""}.`;
+  return { cookies, storageApplied, storageOrigin, queuedOrigins: [...queued], text };
 }
 
-export async function applyPendingStorage(session: PageSession, pending: PendingStorage, options: { signal?: AbortSignal } = {}): Promise<string | undefined> {
+export async function applyPendingStorage(session: StorageEngine, pending: PendingStorage, options: { signal?: AbortSignal } = {}): Promise<string | undefined> {
   if (!pending.size) return undefined;
   const origin = await activeOrigin(session, options.signal);
   if (origin === "null") return undefined;

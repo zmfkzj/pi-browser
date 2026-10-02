@@ -3,36 +3,22 @@ import { dirname, join, resolve } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import type { BrowserConfig } from "./config.js";
 import { defaultSpillDir } from "./output.js";
-import { summarizePage, type PageSession } from "./page.js";
+import { summarizePage } from "./page.js";
+import { UnsupportedOperationError, type BrowserEngine, type Target } from "./engine.js";
 
-export { describeError } from "./page.js";
-export interface Target { ref?: string; selector?: string }
-
-export function targetArgs({ ref, selector }: Target): { ref: string } | { selector: string } {
+export { describeError } from "./engines/obscura.js";
+export function targetArgs({ ref, selector }: { ref?: string; selector?: string }, engine?: BrowserEngine): Target {
   if ((ref !== undefined) === (selector !== undefined)) throw new Error("Provide exactly one of ref or selector.");
-  if (ref !== undefined) {
-    if (!/^e\d+$/.test(ref)) throw new Error("ref must match /^e\\d+$/ (for example e1).");
-    return { ref };
-  }
+  if (ref !== undefined) return { ref };
   if (!selector?.trim()) throw new Error("selector must be a non-empty string.");
+  // TODO: engines may emulate selectors via evaluate; expose that through capabilities.selectors.
+  if (engine && !engine.capabilities.selectors) throw new UnsupportedOperationError(engine.name, "CSS selectors", engine.name === "chrome" ? "obscura" : "chrome");
   return { selector };
 }
-
-export function refToSelector(ref: string): string {
-  targetArgs({ ref });
-  return `[data-obscura-ref="${ref}"]`;
+export function optionalTarget(params: { ref?: string; selector?: string }, engine?: BrowserEngine): Target | undefined {
+  return params.ref === undefined && params.selector === undefined ? undefined : targetArgs(params, engine);
 }
-
-export function optionalTarget(params: Target): Record<string, string> {
-  return params.ref === undefined && params.selector === undefined ? {} : targetArgs(params);
-}
-
-export function selectorTarget(params: Target): { selector: string } {
-  const target = targetArgs(params);
-  return { selector: "ref" in target ? refToSelector(target.ref) : target.selector };
-}
-
-export async function actionResult(session: PageSession, headline: string, params: { snapshot?: boolean }, config: BrowserConfig, signal?: AbortSignal): Promise<string> {
+export async function actionResult(session: BrowserEngine, headline: string, params: { snapshot?: boolean }, config: BrowserConfig, signal?: AbortSignal): Promise<string> {
   return params.snapshot === false ? headline : `${headline}\n\n${await summarizePage(session, { maxChars: config.actionSummaryChars, limit: 40, signal })}`;
 }
 

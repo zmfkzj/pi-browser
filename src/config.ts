@@ -1,6 +1,20 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 
+export type EngineSetting = "auto" | "obscura" | "chrome";
+export type Exposure = "hybrid" | "direct" | "deferred";
+
+export interface ChromeConfig {
+  enabled: boolean;
+  headless: "auto" | boolean;
+  isolated: boolean;
+  channel: "stable" | "beta" | "dev" | "canary";
+  executablePath: string | null;
+  browserUrl: string | null;
+  viewport: string | null;
+  args: string[];
+}
+
 export interface BrowserConfig {
   binaryPath: string | null;
   version: string;
@@ -18,8 +32,25 @@ export interface BrowserConfig {
   maxOutputChars: number;
   actionSummaryChars: number;
   artifactsDir: string | null;
-  exposure: "direct" | "deferred";
+  engine: EngineSetting;
+  chrome: ChromeConfig;
+  exposure: Exposure;
 }
+
+/** Config files may override individual Chrome settings without replacing the object. */
+export type BrowserConfigPatch = Omit<Partial<BrowserConfig>, "chrome"> & { chrome?: Partial<ChromeConfig> };
+
+const DEFAULT_CHROME_CONFIG: Readonly<ChromeConfig> = Object.freeze({
+  enabled: true,
+  headless: "auto",
+  isolated: false,
+  channel: "stable",
+  executablePath: null,
+  browserUrl: null,
+  viewport: null,
+  args: [],
+});
+Object.freeze(DEFAULT_CHROME_CONFIG.args);
 
 export const DEFAULT_BROWSER_CONFIG: Readonly<BrowserConfig> = Object.freeze({
   binaryPath: null,
@@ -38,7 +69,9 @@ export const DEFAULT_BROWSER_CONFIG: Readonly<BrowserConfig> = Object.freeze({
   maxOutputChars: 12_000,
   actionSummaryChars: 3000,
   artifactsDir: null,
-  exposure: "direct",
+  engine: "auto",
+  chrome: DEFAULT_CHROME_CONFIG,
+  exposure: "hybrid",
 });
 
 export interface LoadedBrowserConfig {
@@ -52,7 +85,48 @@ export function isValidProfileName(value: unknown): value is string {
   return typeof value === "string" && /^[\w.-]{1,64}$/.test(value);
 }
 
-function validate(value: unknown): Partial<BrowserConfig> {
+function validateChrome(value: unknown, problems: string[]): void {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    problems.push("chrome must be a JSON object");
+    return;
+  }
+  for (const [key, entry] of Object.entries(value)) {
+    if (!Object.hasOwn(DEFAULT_CHROME_CONFIG, key)) {
+      problems.push(`unknown key "chrome.${key}"`);
+      continue;
+    }
+    let valid = false;
+    let expected = "";
+    switch (key) {
+      case "enabled":
+      case "isolated":
+        valid = typeof entry === "boolean";
+        expected = "a boolean";
+        break;
+      case "headless":
+        valid = entry === "auto" || typeof entry === "boolean";
+        expected = '"auto" or a boolean';
+        break;
+      case "channel":
+        valid = entry === "stable" || entry === "beta" || entry === "dev" || entry === "canary";
+        expected = '"stable", "beta", "dev" or "canary"';
+        break;
+      case "executablePath":
+      case "browserUrl":
+      case "viewport":
+        valid = entry === null || (typeof entry === "string" && entry.trim().length > 0);
+        expected = "a non-empty string or null";
+        break;
+      case "args":
+        valid = Array.isArray(entry) && entry.every((arg: unknown) => typeof arg === "string");
+        expected = "an array of strings";
+        break;
+    }
+    if (!valid) problems.push(`chrome.${key} must be ${expected}`);
+  }
+}
+
+function validate(value: unknown): BrowserConfigPatch {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     throw new Error("expected a JSON object");
   }
@@ -89,9 +163,16 @@ function validate(value: unknown): Partial<BrowserConfig> {
         valid = entry === null || isValidProfileName(entry);
         expected = 'a profile name matching /^[\\w.-]{1,64}$/ or null';
         break;
+      case "engine":
+        valid = entry === "auto" || entry === "obscura" || entry === "chrome";
+        expected = '"auto", "obscura" or "chrome"';
+        break;
+      case "chrome":
+        validateChrome(entry, problems);
+        continue;
       case "exposure":
-        valid = entry === "direct" || entry === "deferred";
-        expected = '"direct" or "deferred"';
+        valid = entry === "hybrid" || entry === "direct" || entry === "deferred";
+        expected = '"hybrid", "direct" or "deferred"';
         break;
       case "allowPrivateNetwork":
       case "stealth":
@@ -108,7 +189,7 @@ function validate(value: unknown): Partial<BrowserConfig> {
     if (!valid) problems.push(`${key} must be ${expected}`);
   }
   if (problems.length > 0) throw new Error(problems.join("; "));
-  return value as Partial<BrowserConfig>;
+  return value as BrowserConfigPatch;
 }
 
 export { validate as validateBrowserConfig };
@@ -119,13 +200,21 @@ export async function loadBrowserConfig(options: {
   agentDir: string;
   projectTrusted: boolean;
 }): Promise<LoadedBrowserConfig> {
-  const result: LoadedBrowserConfig = { config: { ...DEFAULT_BROWSER_CONFIG }, sources: [], errors: [] };
+  const result: LoadedBrowserConfig = {
+    config: { ...DEFAULT_BROWSER_CONFIG, chrome: { ...DEFAULT_CHROME_CONFIG, args: [] } },
+    sources: [], errors: [],
+  };
   const paths = [join(options.agentDir, "browser.config.json")];
   if (options.projectTrusted) paths.push(join(options.cwd, ".pi", "browser.config.json"));
   for (const path of paths) {
     try {
       const values = validate(JSON.parse(await readFile(path, "utf8")) as unknown);
-      Object.assign(result.config, values);
+      const { chrome, ...topLevel } = values;
+      Object.assign(result.config, topLevel);
+      if (chrome) {
+        Object.assign(result.config.chrome, chrome);
+        if (chrome.args) result.config.chrome.args = [...chrome.args];
+      }
       result.sources.push(path);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;

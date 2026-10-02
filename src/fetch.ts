@@ -3,7 +3,8 @@ import { Type } from "@sinclair/typebox";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { describeError, httpUrl } from "./actions.js";
 import type { BrowserConfig } from "./config.js";
-import { buildChildEnv, obscuraGlobalArgs } from "./mcp-client.js";
+import { buildChildEnv, buildFetchArgs } from "./engines/obscura.js";
+import { toolExposure, deferredToolGuideline } from "./exposure.js";
 import { mcpContentToToolContent } from "./output.js";
 
 export interface FetchToolDeps {
@@ -24,23 +25,7 @@ export interface FetchParams {
   selector?: string;
 }
 
-/** Build argv without a shell; validate even when called outside the tool schema. */
-export function buildFetchArgs(url: string, params: FetchParams, config: BrowserConfig): string[] {
-  httpUrl(url, "browser_fetch");
-  const timeoutMs = params.timeoutMs ?? 30000;
-  if (!Number.isInteger(timeoutMs) || timeoutMs < 1000 || timeoutMs > 120000) throw new Error("timeoutMs must be an integer from 1000 to 120000.");
-  const format = params.format ?? "markdown";
-  if (!["text", "markdown", "html", "links"].includes(format)) throw new Error("Unsupported fetch format.");
-  if (params.maxChars !== undefined && (!Number.isSafeInteger(params.maxChars) || params.maxChars < 1)) throw new Error("maxChars must be a positive integer.");
-  if (params.waitUntil !== undefined && !["load", "domcontentloaded", "networkidle0"].includes(params.waitUntil)) throw new Error("Unsupported waitUntil value.");
-  if (params.selector !== undefined && !params.selector.trim()) throw new Error("selector must be a non-empty string.");
-  const args = ["fetch", url, "--dump", format, "--timeout", String(Math.ceil(timeoutMs / 1000))];
-  if (params.waitUntil !== undefined) args.push("--wait-until", params.waitUntil);
-  if (params.selector !== undefined) args.push("--selector", params.selector);
-  args.push(...obscuraGlobalArgs(config));
-  if (config.userAgent) args.push("--user-agent", config.userAgent);
-  return args;
-}
+export { buildFetchArgs } from "./engines/obscura.js";
 
 const MAX_STDOUT_BYTES = 8 * 1024 * 1024;
 
@@ -116,8 +101,8 @@ export function registerFetchTool(pi: ExtensionAPI, deps: FetchToolDeps): string
   const description = "Read an HTTP(S) page once as markdown, text, HTML, or links. Independent of the MCP session: no login state and no refs; prefer session tools for authenticated pages or interactions.";
   pi.registerTool({
     name, label: "Browser fetch", description, promptSnippet: description,
-    exposure: deps.getConfig().exposure, executionMode: "sequential",
-    ...(deps.guideline ? { promptGuidelines: [deps.guideline] } : {}),
+    exposure: toolExposure(name, deps.getConfig().exposure), executionMode: "sequential",
+    promptGuidelines: [...(deps.guideline ? [deps.guideline] : []), ...(toolExposure(name, deps.getConfig().exposure) === "direct" && deferredToolGuideline(deps.getConfig().exposure) ? [deferredToolGuideline(deps.getConfig().exposure)] : [])],
     annotations: { openWorldHint: true, readOnlyHint: true },
     parameters: Type.Object({
       url: Type.String({ minLength: 1 }),

@@ -1,7 +1,7 @@
 import { runInNewContext } from "node:vm";
 import { describe, expect, it, vi } from "vitest";
 import { applyPendingStorage, restoreStorageState, validateRestorableState, type PendingStorage } from "../src/state.js";
-import type { PageSession } from "../src/page.js";
+import { checkedText, type PageSession } from "../src/page.js";
 
 const origin = "https://example.com";
 function fixture(initialOrigin = origin) {
@@ -18,7 +18,7 @@ function fixture(initialOrigin = origin) {
     });
     return { content: [{ type: "text", text: String(value) }], isError: false };
   });
-  return { call, localStorage, sessionStorage, navigate: (next: string) => { activeOrigin = next; } };
+  return { call, evaluate: async (expression: string, signal?: AbortSignal) => checkedText(await call("browser_evaluate", { expression }, { signal })), setStorageState: async (state: unknown, signal?: AbortSignal) => checkedText(await call("browser_set_storage_state", { state }, { signal })), localStorage, sessionStorage, navigate: (next: string) => { activeOrigin = next; } };
 }
 
 describe("origin storage restore", () => {
@@ -81,5 +81,20 @@ describe("origin storage restore", () => {
     expect(session.localStorage.get("k")).toBe("new");
     expect(session.sessionStorage.get("s")).toBe("1");
     expect(pending.has("null")).toBe(true);
+  });
+});
+
+describe('Chrome partial storage restore', () => {
+  it('does not treat cookies-skipped text as failure, counts zero cookies and applies both stores',async ()=> {
+    const session=fixture();
+    const setStorageState=vi.fn(async ()=>'cookies skipped on chrome (not supported); storage entries are applied by script');
+    const pending:PendingStorage=new Map();
+    const report=await restoreStorageState({...session,setStorageState},{cookies:[{name:'ignored'}],origins:[{origin,localStorage:[['k','v']],sessionStorage:[['s','1']]},{origin:'https://other.example',localStorage:[['later','yes']]}]},{pending});
+    expect(setStorageState).toHaveBeenCalledOnce();expect(session.call.mock.calls.every(([name])=>name==='browser_evaluate')).toBe(true);
+    expect(report).toMatchObject({cookies:0,storageApplied:2,storageOrigin:origin,queuedOrigins:['https://other.example']});
+    expect(report.text).toContain('cookies skipped on chrome (not supported)');
+    expect(session.localStorage.get('k')).toBe('v');expect(session.sessionStorage.get('s')).toBe('1');
+    session.navigate('https://other.example');
+    expect(await applyPendingStorage(session,pending)).toContain('Applied 1 queued storage entries');expect(session.localStorage.get('later')).toBe('yes');
   });
 });

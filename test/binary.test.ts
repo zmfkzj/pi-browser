@@ -78,14 +78,15 @@ describe("resolveObscuraBinary", () => {
     expect(result).toEqual({ ok: true, path: join(root, "virtual"), source: "config" });
   });
 
-  it("explains manual provisioning and the managed cache on failure", () => {
-    const result = resolve();
+  it.each(["0.2.3", "0.2.4"])("explains provisioning, the managed cache, and installing pinned v%s on failure", (version) => {
+    const result = resolve({ config: { ...DEFAULT_BROWSER_CONFIG, version } });
     expect(result.ok).toBe(false);
     if (result.ok) throw new Error("expected failure");
-    for (const hint of ["binaryPath", "PI_BROWSER_OBSCURA_BIN", "PATH", "No binary is bundled", "0.2.3"]) {
+    for (const hint of ["binaryPath", "PI_BROWSER_OBSCURA_BIN", "PATH", "No binary is bundled", managedBinaryPath(root, version, "linux")]) {
       expect(result.message).toContain(hint);
     }
     expect(result.message).not.toContain("later milestone");
+    expect(result.message.endsWith(`Run /browser install to download the pinned release v${version}, or set autoInstall to "ask" to be prompted on first use.`)).toBe(true);
   });
 });
 

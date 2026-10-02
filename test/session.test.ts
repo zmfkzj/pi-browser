@@ -10,7 +10,7 @@ import { checkedText } from "../src/page.js";
 const server = fileURLToPath(new URL("./helpers/fake-mcp-server.mjs", import.meta.url));
 const sessions: BrowserSession[] = [];
 function session(config: Partial<BrowserConfig> = {}, extra: Partial<BrowserSessionOptions> = {}): BrowserSession {
-  const instance = new BrowserSession({ config: { ...DEFAULT_BROWSER_CONFIG, ...config }, binary: process.execPath, source: "env",
+  const instance = new BrowserSession({ config: { ...DEFAULT_BROWSER_CONFIG, ...config }, deadlines: { browser_evaluate: config.evaluateTimeoutMs ?? DEFAULT_BROWSER_CONFIG.evaluateTimeoutMs }, binary: process.execPath, source: "env",
     launch: () => spawn(process.execPath, [server], { stdio: "pipe" }), ...extra });
   sessions.push(instance);
   return instance;

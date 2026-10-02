@@ -1,0 +1,31 @@
+{
+  "name": "pi-browser",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "keywords": ["pi-package"],
+  "pi": {
+    "skills": ["./skills"],
+    "extensions": ["./src/extension/index.ts"]
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@sinclair/typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-agent-core": "0.99.2",
+    "@earendil-works/pi-ai": "0.99.2",
+    "@earendil-works/pi-coding-agent": "0.99.2",
+    "@sinclair/typebox": "^0.34.41",
+    "@types/node": "^24",
+    "vitest": "^3.2",
+    "tsx": "^4.20",
+    "typescript": "^5.9"
+  }
+}

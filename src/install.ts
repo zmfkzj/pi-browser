@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { chmod, mkdir, mkdtemp, open, readdir, rename, rm, stat } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, open, readdir, rename, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { managedBinaryPath, managedCacheDir, releaseAsset } from "./binary.js";
@@ -100,14 +100,21 @@ async function verifyBinary(path: string, o: InstallObscuraOptions): Promise<voi
   }
 }
 
-/** Only old backup directories are garbage; never select them as installed versions. */
-async function removeStaleBackups(cache: string, startedAt: number): Promise<void> {
+/** Never collect another process's live rollback backup, regardless of its mtime. */
+async function removeStaleBackups(cache: string): Promise<void> {
   try {
     for (const entry of await readdir(cache, { withFileTypes: true })) {
-      if (!entry.isDirectory() || !entry.name.includes(".bak-")) continue;
-      const path = join(cache, entry.name);
+      const owner = /\.bak-(\d+)-/.exec(entry.name);
+      if (!entry.isDirectory() || !owner) continue;
+      const pid = Number(owner[1]);
+      if (!Number.isSafeInteger(pid) || pid <= 0) continue;
       try {
-        if ((await stat(path)).mtimeMs < startedAt) await rm(path, { recursive: true, force: true });
+        // The in-process install guard ensures our own leftovers are no longer live.
+        if (pid !== process.pid) {
+          try { process.kill(pid, 0); continue; }
+          catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") continue; }
+        }
+        await rm(join(cache, entry.name), { recursive: true, force: true });
       } catch { /* Startup hygiene must not prevent an install. */ }
     }
   } catch { /* Best effort, including unreadable cache directories. */ }
@@ -118,7 +125,6 @@ export async function installObscura(o: InstallObscuraOptions): Promise<InstallO
   if (installing) throw new Error("An obscura install is already in progress.");
   installing = true;
   let temp: string | undefined;
-  const startedAt = Date.now();
   try {
     o.signal?.throwIfAborted();
     if (!/^\d+\.\d+\.\d+(?:-[\w.-]+)?$/.test(o.version)) throw new Error("Invalid obscura release version.");
@@ -126,7 +132,7 @@ export async function installObscura(o: InstallObscuraOptions): Promise<InstallO
     if (!asset) throw new Error(`No obscura release asset for ${o.platform}/${o.arch}. Install manually (see README).`);
     const cache = managedCacheDir(o.agentDir);
     await mkdir(cache, { recursive: true });
-    await removeStaleBackups(cache, startedAt);
+    await removeStaleBackups(cache);
     const expected = await trustedChecksum(o, asset);
     o.signal?.throwIfAborted();
     temp = await mkdtemp(join(cache, "tmp-"));
@@ -172,7 +178,7 @@ export async function installObscura(o: InstallObscuraOptions): Promise<InstallO
     await verifyBinary(rootBinary, o);
     o.signal?.throwIfAborted();
     const destination = join(cache, o.version);
-    const backupPath = `${destination}.bak-${randomUUID()}`;
+    const backupPath = `${destination}.bak-${process.pid}-${randomUUID()}`;
     let backup: string | undefined;
     try {
       try {

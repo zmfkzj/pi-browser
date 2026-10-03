@@ -1,4 +1,4 @@
-import { execFile } from "node:child_process";
+import { execFile, spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import { access, mkdir, mkdtemp, readFile, readdir, rm, stat, utimes, writeFile } from "node:fs/promises";
@@ -181,7 +181,9 @@ describe("installObscura", () => {
 
   it("cleans stale backup directories at startup without removing other installs or temp directories", async () => {
     const cache = managedCacheDir(agentDir);
-    const stale = join(cache, `${version}.bak-stale`);
+    const owner = spawnSync(process.execPath, ["-e", ""]).pid;
+    expect(() => process.kill(owner, 0)).toThrow();
+    const stale = join(cache, `${version}.bak-${owner}-stale`);
     const other = join(cache, "0.2.3");
     const strayTemp = join(cache, "tmp-stray");
     await mkdir(stale, { recursive: true });
@@ -194,6 +196,47 @@ describe("installObscura", () => {
     expect(await cacheEntries()).toEqual(["0.2.3", "tmp-stray"]);
     await installObscura(options());
     expect(await cacheEntries()).toEqual(["0.2.3", version, "tmp-stray"]);
+  });
+
+  it("preserves another process's live rollback backup even when rename keeps an old mtime", async () => {
+    const binary = await seedPreviousInstall();
+    const destination = join(managedCacheDir(agentDir), version);
+    await utimes(destination, new Date(0), new Date(0));
+    const script = `const { renameSync } = require('node:fs');
+      const destination = process.argv[1];
+      const backup = destination + '.bak-' + process.pid + '-live';
+      renameSync(destination, backup);
+      process.send(backup);
+      process.on('message', () => { renameSync(backup, destination); process.disconnect(); });`;
+    const owner = spawn(process.execPath, ["-e", script, destination], { stdio: ["ignore", "ignore", "pipe", "ipc"] });
+    const exited = new Promise<number | null>(resolve => owner.once("close", resolve));
+    try {
+      const backup = await new Promise<string>((resolve, reject) => {
+        owner.once("message", value => resolve(String(value)));
+        owner.once("error", reject);
+        owner.once("exit", () => reject(new Error("Backup owner exited before preserving the install")));
+      });
+      expect((await stat(backup)).mtimeMs).toBe(0);
+      await expect(installObscura(options({ checksum: "invalid" }))).rejects.toThrow("verified SHA-256");
+      expect(await readFile(join(backup, "obscura"), "utf8")).toBe(previousBinary);
+      owner.send("rollback");
+      expect(await exited).toBe(0);
+      expect(await readFile(binary, "utf8")).toBe(previousBinary);
+    } finally {
+      owner.kill("SIGKILL");
+      await exited;
+    }
+  });
+
+  it("retains backups with unknown owners or inaccessible live owner pids", async () => {
+    const cache = managedCacheDir(agentDir);
+    const names = [`${version}.bak-legacy`, `${version}.bak-123456789-protected`];
+    for (const name of names) await mkdir(join(cache, name), { recursive: true });
+    const kill = vi.spyOn(process, "kill").mockImplementation(() => { throw Object.assign(new Error("denied"), { code: "EPERM" }); });
+    try {
+      await expect(installObscura(options({ checksum: "invalid" }))).rejects.toThrow("verified SHA-256");
+      expect(await cacheEntries()).toEqual([...names].sort());
+    } finally { kill.mockRestore(); }
   });
 
   it("rejects checksum mismatches and leaves no temporary or installed directory", async () => {

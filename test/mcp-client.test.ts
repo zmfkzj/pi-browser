@@ -1,7 +1,9 @@
 import { readFileSync } from "node:fs";
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
+import { EventEmitter } from "node:events";
+import { PassThrough } from "node:stream";
 import { fileURLToPath } from "node:url";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_BROWSER_CONFIG } from "../src/config.js";
 import { BrowserAbortedError, BrowserRestartedError, McpStdioClient, buildChildEnv, buildObscuraArgs, obscuraGlobalArgs, type McpToolResult } from "../src/mcp-client.js";
 
@@ -140,6 +142,50 @@ describe("McpStdioClient", () => {
     await instance.close();
     expect(Date.now() - started).toBeGreaterThanOrEqual(1900);
     expect(alive(pid)).toBe(false);
+  });
+
+  it.each([{ emitsClose: true, deadline: false }, { emitsClose: false, deadline: false }, { emitsClose: false, deadline: true }])("uses child.kill on Windows and bounds missing close events ($emitsClose, deadline: $deadline)", async ({ emitsClose, deadline }) => {
+    vi.useFakeTimers();
+    const groupKill = vi.spyOn(process, "kill").mockImplementation(() => { throw new Error("Windows has no POSIX process groups"); });
+    const child = new EventEmitter() as ChildProcess;
+    Object.assign(child, { pid: 12345, exitCode: null, signalCode: null,
+      stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(),
+      kill: vi.fn((signal: NodeJS.Signals) => {
+        if (emitsClose) queueMicrotask(() => child.emit("close", null, signal));
+        return true;
+      }),
+    });
+    child.stdin!.on("data", (chunk: Buffer) => {
+      const request = JSON.parse(chunk.toString());
+      if (request.method === "initialize") child.stdout!.emit("data", `${JSON.stringify({ id: request.id, result: {} })}\n`);
+    });
+    const instance = new McpStdioClient({ label: "chrome", command: "unused", args: [],
+      detached: true, platform: "win32", defaultDeadlineMs: 2000, launch: () => child });
+    clients.push(instance);
+    try {
+      await instance.initialize();
+      let closing: Promise<void> | undefined;
+      if (deadline) {
+        const rejected = expect(instance.callTool("hang", {}, { deadlineMs: 10 })).rejects.toBeInstanceOf(BrowserRestartedError);
+        await vi.advanceTimersByTimeAsync(10);
+        await rejected;
+      } else closing = instance.close();
+      expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+      if (!emitsClose) {
+        await vi.advanceTimersByTimeAsync(2000);
+        expect(child.kill).toHaveBeenCalledWith("SIGKILL");
+        await vi.advanceTimersByTimeAsync(2000);
+      }
+      // Closing after a prior watchdog timeout must not wait on its stale exit promise.
+      closing ??= instance.close();
+      await closing;
+      expect(groupKill).not.toHaveBeenCalled();
+      expect(instance.isRunning).toBe(false);
+      expect(instance.close()).toBe(closing);
+    } finally {
+      groupKill.mockRestore();
+      vi.useRealTimers();
+    }
   });
 
   it("bounds handshake hangs by the request deadline", async () => {

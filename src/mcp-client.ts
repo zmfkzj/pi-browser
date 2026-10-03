@@ -27,6 +27,8 @@ export interface McpClientOptions {
   args: string[];
   defaultDeadlineMs: number;
   detached?: boolean;
+  /** Internal test seam for platform-specific child termination. */
+  platform?: NodeJS.Platform;
   launch?: () => ChildProcess;
   env?: NodeJS.ProcessEnv;
   onStateChange?: (state: { running: boolean; pid: number | undefined }) => void;
@@ -161,6 +163,8 @@ export class McpStdioClient {
       const finish = (reason: string) => {
         if (finished) return;
         finished = true;
+        // A timed-out Windows child may report close after a replacement starts.
+        if (this.child !== child) { resolve(); return; }
         this.initialized = false;
         if (!this.termination) this.failAll(new Error(`${reason}. ${this.options.label} process exited; open tabs were lost.\n${this.stderrTail()}`));
         this.options.onStateChange?.({ running: false, pid: undefined });
@@ -230,13 +234,15 @@ export class McpStdioClient {
   private terminate(): Promise<void> {
     if (this.termination) return this.termination;
     const child = this.child;
-    if (!child || (!this.options.detached && (child.exitCode !== null || child.signalCode !== null))) return this.exitPromise;
+    const windows = (this.options.platform ?? process.platform) === "win32";
+    const processGroup = this.options.detached && !windows;
+    if (!child || (!windows && !processGroup && (child.exitCode !== null || child.signalCode !== null))) return this.exitPromise;
     this.initialized = false;
     this.options.onStateChange?.({ running: false, pid: undefined });
     child.stdin?.end();
     const kill = (signal: NodeJS.Signals) => {
       try {
-        if (this.options.detached && child.pid) process.kill(-child.pid, signal);
+        if (processGroup && child.pid) process.kill(-child.pid, signal);
         else child.kill(signal);
       } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; }
     };
@@ -246,8 +252,14 @@ export class McpStdioClient {
       timer = setTimeout(() => { kill("SIGKILL"); resolve(); }, 2000);
       timer.unref();
     });
-    this.termination = this.exitPromise.then(async () => {
-      if (this.options.detached && child.pid) {
+    let exitTimer: NodeJS.Timeout | undefined;
+    // Windows has no POSIX process groups, and a failed kill or inherited pipe
+    // must not leave close waiting forever for the child's close event.
+    const exited = windows ? Promise.race([this.exitPromise, new Promise<void>(resolve => {
+      exitTimer = setTimeout(resolve, 4000);
+    })]) : this.exitPromise;
+    this.termination = exited.then(async () => {
+      if (processGroup && child.pid) {
         // The MCP parent can exit while Chrome descendants ignore SIGTERM. Do not
         // cancel escalation until the whole group is gone, not merely the parent.
         try { process.kill(-child.pid, 0); await escalation; }
@@ -255,6 +267,11 @@ export class McpStdioClient {
       }
     }).finally(() => {
       clearTimeout(timer);
+      clearTimeout(exitTimer);
+      if (windows && this.child === child) {
+        this.child = undefined;
+        this.exitPromise = Promise.resolve();
+      }
       this.termination = undefined;
     });
     return this.termination;

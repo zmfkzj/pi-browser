@@ -193,7 +193,7 @@ export function createBrowserExtension(options: BrowserExtensionOptions = {}) {
         },
       });
       manager = new EngineManager({ config: loaded.config,
-        factories: { obscura: () => obscura!, chrome: () => new ChromeEngine({ config: loaded.config, cwd: ctx.cwd, env: options.env, launch: options.launchChrome,
+        factories: { obscura: () => obscura!, chrome: () => new ChromeEngine({ config: loaded.config, cwd: ctx.cwd, env: options.env, pathDirs: options.pathDirs, launch: options.launchChrome,
           onStateChange: ({ running }) => { if (!running) manager?.engineStopped("chrome"); const state = manager?.active()?.status(); setStatus(state?.running ?? false, state?.pid); },
         }), ...options.engineFactories },
         availability: {

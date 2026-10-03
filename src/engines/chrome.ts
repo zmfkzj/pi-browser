@@ -45,13 +45,14 @@ export function buildChromeEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const keys = ["PATH", "HOME", "DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS", "LANG", "TMPDIR", "TMP", "TEMP"];
   return Object.fromEntries(Object.entries(env).filter(([k, v]) => v !== undefined && (keys.includes(k) || /^(CHROME_|PUPPETEER_)/.test(k))));
 }
-export function buildChromeArgs(config: BrowserConfig, env: NodeJS.ProcessEnv = process.env): string[] {
+export function buildChromeArgs(config: BrowserConfig, env: NodeJS.ProcessEnv = process.env, detectedExecutablePath?: string): string[] {
   const c = config.chrome, args: string[] = [];
+  const executablePath = c.executablePath ?? (!c.browserUrl ? detectedExecutablePath : undefined);
   if (c.headless === true || (c.headless === "auto" && !env.DISPLAY && !env.WAYLAND_DISPLAY)) args.push("--headless");
   if (c.isolated) args.push("--isolated");
-  if (c.executablePath) args.push("--executablePath", c.executablePath);
+  if (executablePath) args.push("--executablePath", executablePath);
   if (c.browserUrl) args.push("--browserUrl", c.browserUrl);
-  if (!c.executablePath && !c.browserUrl) args.push("--channel", c.channel);
+  if (!executablePath && !c.browserUrl) args.push("--channel", c.channel);
   if (c.viewport) args.push("--viewport", c.viewport);
   // Keep this local adapter offline: upstream defaults otherwise send usage statistics and CrUX queries.
   args.push("--no-usage-statistics", "--no-performance-crux");
@@ -92,6 +93,7 @@ export interface ChromeEngineOptions {
   command?: string;
   args?: string[];
   serverBin?: string;
+  pathDirs?: string[];
   onStateChange?: (state: { running: boolean; pid: number | undefined }) => void;
 }
 export class ChromeEngine implements BrowserEngine {
@@ -103,7 +105,11 @@ export class ChromeEngine implements BrowserEngine {
   private activeCalls = 0;
   private insightSetId?: string;
   constructor(private readonly options: ChromeEngineOptions) {}
-  private flags() { return [...buildChromeArgs(this.options.config, this.options.env ?? process.env), "--workspace", this.options.cwd ?? process.cwd()]; }
+  private flags() {
+    const env = this.options.env ?? process.env;
+    const detected = chromeAvailability(this.options.config, env, { pathDirs: this.options.pathDirs }).executablePath;
+    return [...buildChromeArgs(this.options.config, env, detected), "--workspace", this.options.cwd ?? process.cwd()];
+  }
   private getClient(): McpStdioClient {
     if (!this.client) {
       const bin = this.options.serverBin ?? resolveChromeServer();
@@ -151,7 +157,8 @@ export class ChromeEngine implements BrowserEngine {
     return refs[index]!;
   }
   async navigate(url: string, opts: { waitUntil?: string; signal?: AbortSignal }) {
-    await this.call("navigate_page", { url, timeout: this.options.config.timeoutMs }, opts.signal);
+    const text = await this.call("navigate_page", { url, timeout: this.options.config.timeoutMs }, opts.signal);
+    if (/^Unable to navigate in the selected page:/m.test(text)) throw new Error(text);
     const title = await this.expression("document.title", opts.signal);
     return `Navigated (chrome) to ${url} — ${JSON.stringify(title)}`;
   }
@@ -275,5 +282,5 @@ export class ChromeEngine implements BrowserEngine {
   }
   async restart() { await this.stop(); await this.getClient().initialize(); }
   async stop() { clearTimeout(this.idleTimer); const client = this.client; this.client = undefined; this.pageId = undefined; this.insightSetId = undefined; await client?.close(); }
-  status() { const c = this.options.config.chrome; const availability = chromeAvailability(this.options.config, this.options.env ?? process.env); return { running: this.client?.isRunning ?? false, pid: this.client?.pid, binary: c.executablePath ?? availability.executablePath, detail: `${c.browserUrl ? `attached to ${c.browserUrl}` : `${this.flags().includes('--headless') ? 'headless' : 'headed'} ${c.executablePath ?? availability.executablePath ?? c.channel}`} | flags: ${this.flags().join(' ')}${this.client?.stderrTail() ? ` | stderr: ${this.client.stderrTail()}` : ''}` }; }
+  status() { const c = this.options.config.chrome; const availability = chromeAvailability(this.options.config, this.options.env ?? process.env, { pathDirs: this.options.pathDirs }); return { running: this.client?.isRunning ?? false, pid: this.client?.pid, binary: c.executablePath ?? availability.executablePath, detail: `${c.browserUrl ? `attached to ${c.browserUrl}` : `${this.flags().includes('--headless') ? 'headless' : 'headed'} ${c.executablePath ?? availability.executablePath ?? c.channel}`} | flags: ${this.flags().join(' ')}${this.client?.stderrTail() ? ` | stderr: ${this.client.stderrTail()}` : ''}` }; }
 }

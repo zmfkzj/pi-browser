@@ -4,6 +4,7 @@
 import { appendFileSync, readFileSync } from 'node:fs';
 import { createInterface } from 'node:readline';
 import { runInNewContext } from 'node:vm';
+if (process.env.CHROME_FAKE_RECORD_ARGS) appendFileSync(process.env.CHROME_FAKE_RECORD_ARGS, JSON.stringify(process.argv.slice(2)));
 const { tools } = JSON.parse(readFileSync(new URL('../fixtures/chrome-devtools-mcp-tools.json', import.meta.url), 'utf8'));
 const png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=';
 const calls = [], pages = new Map(), stores = new Map();
@@ -89,6 +90,7 @@ createInterface({input:process.stdin}).on('line',async line => {
       case 'select_page': selected=a.pageId; out=listing(); break;
       case 'close_page': if(pages.size===1) out='The last open page cannot be closed. It is fine to keep it open.'; else { pages.delete(a.pageId); if(selected===a.pageId) selected=pages.keys().next().value; out=listing(); } break;
       case 'navigate_page':
+        if(a.url?.startsWith('https://navigation-failure.test/')) { reply(id,{content:[{type:'text',text:`# navigate_page response\nUnable to navigate in the selected page: net::${new URL(a.url).pathname.slice(1)} at ${a.url}.`}]}); return; }
         if(a.url) {p.url=a.url;p.history.splice(p.index+1);p.history.push(a.url);p.index++;makeNodes(p);} else if(a.type==='back') p.url=p.history[p.index=Math.max(0,p.index-1)]; else if(a.type==='forward') p.url=p.history[p.index=Math.min(p.history.length-1,p.index+1)];
         p.refs.clear(); out=`${a.type==='reload'?'Successfully reloaded the page.':`Successfully navigated ${a.type==='back'?'back ':a.type==='forward'?'forward ':''}to ${p.url}.`}\n${listing()}`; break;
       case 'take_snapshot': out=snapshot(p); break;

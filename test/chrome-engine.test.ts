@@ -38,6 +38,14 @@ describe('Chrome MCP mapping (real stdio fake)', () => {
     expect((await calls()).filter(c=>c.name==='navigate_page').at(-1)?.args).toEqual({pageId:1,url:'https://example.com/',timeout:2000});
     expect((await engine.summarize({maxChars:10,includeInteractive:false})).elements).toBeUndefined();
   });
+  it.each(['ERR_CONNECTION_REFUSED','ERR_NAME_NOT_RESOLVED'])('surfaces unflagged upstream navigation failure %s without evaluating the old page', async error => {
+    const {engine,calls}=await fixture();
+    const before=(await calls()).length;
+    const url=`https://navigation-failure.test/${error}`;
+    await expect(engine.navigate(url,{})).rejects.toThrow(`Unable to navigate in the selected page: net::${error} at ${url}.`);
+    expect((await calls()).slice(before).map(c=>c.name)).toEqual(['navigate_page']);
+  });
+
   it('maps native ref fill/click and surfaces the real stale uid error with refresh guidance', async () => {
     const {engine,ref,evaluate,calls} = await fixture();
     await engine.fill({ref:await ref('Name')},'Alice');
@@ -240,13 +248,27 @@ describe('Chrome availability and launch policy', () => {
     expect(chromeAvailability(config(),{}, {...overrides,platform:'darwin',exists:p=>p.startsWith('/Applications/')})).toMatchObject({ok:true});
     expect(chromeAvailability(config(),{ProgramFiles:'/programs'}, {...overrides,platform:'win32',exists:p=>p==='/programs/Google/Chrome/Application/chrome.exe'})).toMatchObject({ok:true});
   });
+  it.each(['chromium','chrome'])('launches the detected PATH %s binary rather than the stable channel',async name=> {
+    const cwd=await mkdtemp(join(tmpdir(),'chrome-path-'));
+    const binary=join(cwd,name),record=join(cwd,'args.json');
+    await writeFile(binary,'#!/bin/sh\nexit 0\n',{mode:0o755});
+    const engine=new ChromeEngine({config:config(),cwd,serverBin:fake,pathDirs:[cwd],env:{PATH:cwd,CHROME_FAKE_RECORD_ARGS:record}});
+    cleanup.push(async()=>{await engine.stop();await rm(cwd,{recursive:true,force:true});});
+    await engine.navigate('https://example.com/',{});
+    const args=JSON.parse(await readFile(record,'utf8'));
+    expect(args).toContain('--executablePath');
+    expect(args[args.indexOf('--executablePath')+1]).toBe(binary);
+    expect(args).not.toContain('--channel');
+  });
+
   it('uses real flags, auto headless display rule and minimal env',()=> {
     expect(buildChromeArgs(config({isolated:true,viewport:'900x700',executablePath:'/chrome',args:['--chrome-arg=--disable-gpu']}),{})).toEqual(['--headless','--isolated','--executablePath','/chrome','--viewport','900x700','--no-usage-statistics','--no-performance-crux','--chrome-arg=--disable-gpu']);
     expect(buildChromeArgs(config(),{DISPLAY:':0'})).not.toContain('--headless');
     expect(buildChromeArgs(config(),{WAYLAND_DISPLAY:'wayland-0'})).not.toContain('--headless');
     expect(buildChromeArgs(config({headless:true}),{DISPLAY:':0'})).toContain('--headless');
     expect(buildChromeArgs(config({headless:false}),{})).not.toContain('--headless');
-    expect(buildChromeArgs(config({browserUrl:'http://localhost:9222'}),{})).not.toContain('--channel');
+    expect(buildChromeArgs(config({browserUrl:'http://localhost:9222'}),{},'/detected/chromium')).not.toContain('--channel');
+    expect(buildChromeArgs(config({browserUrl:'http://localhost:9222'}),{},'/detected/chromium')).not.toContain('--executablePath');
     expect(buildChromeEnv({PATH:'/bin',HOME:'/home',DISPLAY:':0',LANG:'en',CHROME_TEST:'yes',PUPPETEER_TEST:'yes',SECRET:'no',NODE_OPTIONS:'no'})).toEqual({PATH:'/bin',HOME:'/home',DISPLAY:':0',LANG:'en',CHROME_TEST:'yes',PUPPETEER_TEST:'yes'});
   });
   it('parses roles and fenced object/string output without treating static text as interactive',()=> {

@@ -17,7 +17,8 @@ it.skipIf(!isUmbrella)("loads root batch-install extensions and discovers the br
   const root = await mkdtemp(join(tmpdir(), "browser-root-manifest-"));
   try {
     const manifest = JSON.parse(await readFile(join(repoRoot, "package.json"), "utf8")) as { pi: { extensions: string[]; skills: string[] } };
-    expect(manifest.pi.skills).toEqual(["./browser/skills"]);
+    // Other bundled packages add their own skills (pi-gui does); the browser's root entry stays exact.
+    expect(manifest.pi.skills.filter((path) => path.startsWith("./browser/"))).toEqual(["./browser/skills"]);
     const browserManifest = JSON.parse(await readFile(join(repoRoot, "browser/package.json"), "utf8")) as { pi: { skills: string[] } };
     expect(browserManifest.pi.skills).toEqual(["./skills"]);
     const skillPath = join(repoRoot, "browser/skills/browser/SKILL.md");
@@ -38,7 +39,7 @@ it.skipIf(!isUmbrella)("loads root batch-install extensions and discovers the br
       join(repoRoot, "orche/src/extension/index.ts"), join(repoRoot, "browser/src/extension/index.ts"),
     ]));
     const tools = loaded.extensions.flatMap((extension) => [...extension.tools.keys()]);
-    expect(tools).toEqual(expect.arrayContaining(["orche_run", "browser_navigate", "browser_snapshot", "browser_evaluate"]));
+    expect(tools).toEqual(expect.arrayContaining(["orche_task", "browser_navigate", "browser_snapshot", "browser_evaluate"]));
     // Exercise manifest-based skill discovery, not a separately injected skill path.
     const skillResources = loader.getSkills();
     const browserSkill = skillResources.skills.find((skill) => skill.name === "browser");

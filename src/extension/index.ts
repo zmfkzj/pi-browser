@@ -18,6 +18,7 @@ import { summarizePage } from "../page.js";
 import { registerInteractionTools } from "./tools.js";
 import { decodeEvaluation, wrapExpression } from "../evaluate.js";
 import { applyPendingStorage, restoreStorageState, validateRestorableState } from "../state.js";
+import { completeBrowserArguments } from "./completions.js";
 export { decodeEvaluation, wrapExpression } from "../evaluate.js";
 
 export interface BrowserExtensionOptions {
@@ -291,6 +292,7 @@ export function createBrowserExtension(options: BrowserExtensionOptions = {}) {
     registerTools();
     pi.registerCommand("browser", {
       description: BROWSER_USAGE,
+      getArgumentCompletions: completeBrowserArguments,
       async handler(args, ctx) {
         const command = args.trim();
         const installMatch = /^install(?:\s+(\d+\.\d+\.\d+(?:-[\w.-]+)?))?$/.exec(command);

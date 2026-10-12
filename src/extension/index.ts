@@ -19,6 +19,7 @@ import { registerInteractionTools } from "./tools.js";
 import { decodeEvaluation, wrapExpression } from "../evaluate.js";
 import { applyPendingStorage, restoreStorageState, validateRestorableState } from "../state.js";
 import { completeBrowserArguments } from "./completions.js";
+import { answerWebFetch, isWorkerCapabilityRequest, WEB_FETCH_CAPABILITY, WORKER_CAPABILITY_CHANNEL } from "../worker.js";
 export { decodeEvaluation, wrapExpression } from "../evaluate.js";
 
 export interface BrowserExtensionOptions {
@@ -371,6 +372,12 @@ export function createBrowserExtension(options: BrowserExtensionOptions = {}) {
           ctx.ui.notify(`browser: ${Object.values(engines.engines).some(e => e.running) ? "running" : "idle"}\nActive engine: ${engines.active ?? "none"} | Default engine: ${engines.default} (config: ${engines.configDefault})\n${engineStatus}\nChrome config: ${JSON.stringify(loaded.config.chrome)}\nPID: ${state.pid ?? "none"}\nBinary: ${binary}\nConfig sources: ${loaded.sources.join(", ") || "defaults"}\nConfig errors: ${loaded.errors.join("; ") || "none"}\nCalls: ${state.calls}\nautoInstall: ${loaded.config.autoInstall}\nprofile: ${loaded.config.profile ?? "none"}\nrawMcp: ${loaded.config.rawMcp}\nartifactsDir: ${loaded.config.artifactsDir ?? defaultSpillDir()}\nManaged cache: ${managedCacheDir(agentDir)}`, "info");
         } catch (error) { ctx.ui.notify(error instanceof Error ? error.message : String(error), "error"); }
       },
+    });
+    // orche workers: their own stateless browser_fetch (src/worker.ts). Nothing of this session's engines, tabs, profile
+    // or download consent is shared; session browsing for workers goes through pi-gui's private desktop instead.
+    pi.events.on(WORKER_CAPABILITY_CHANNEL, data => {
+      if (!isWorkerCapabilityRequest(data) || data.capability !== WEB_FETCH_CAPABILITY) return;
+      answerWebFetch(data, { config: loaded.config, agentDir, env: options.env, pathDirs: options.pathDirs, launchFetch: options.launchFetch, killGraceMs: options.fetchKillGraceMs });
     });
     pi.on("session_start", async (_event, ctx) => {
       loading = load(ctx).finally(() => { loading = undefined; });

@@ -23,6 +23,12 @@ description: Use pi-browser to read web pages, interact with forms and authentic
   `browser_hover`, `browser_upload`, `browser_dialog`, `browser_emulate`, `browser_perf`, `browser_network_request`.
   For example, `{ "query": "browser_tabs", "limit": 1 }` activates `browser_tabs` for subsequent calls.
 
+## In an orche worker
+
+Workers lack main's browser tools, tabs, profiles, logins and `tool_search`. A listed `browser_fetch` is your own stateless
+public-page reader (private/loopback refused): use it, not `curl`; without it, say why. Interactive pages need your GUI desktop
+(`mcp__computer_use__*`, observe-only for read-only roles); else report the task needs `gui: true` with role implement.
+
 ## Session workflow
 
 1. `browser_navigate` with an HTTP(S) `url`; optionally choose `engine` and `waitUntil`.

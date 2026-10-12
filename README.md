@@ -261,6 +261,24 @@ Screenshots, PDFs, and `browser_state export` use `artifactsDir` or `<os.tmpdir(
 
 Text exceeding the inline budget is a head/tail preview; full output spills to the process-specific temporary directory, even with a configured `artifactsDir`. Results include `details.spilledPath` and instructions for inspecting the file with `read`/`grep`. Artifacts and spills are not automatically removed. They can contain sensitive page/authentication data: protect and delete them when no longer needed. PNG data also appears once as a model image; PDF/exported-state payloads stay in files.
 
+## orche workers
+
+pi-browser answers orche's `web-fetch` worker capability (`src/worker.ts`): every orche worker and sub-worker gets its
+**own** `browser_fetch` instance in its own session, nothing else.
+
+- Shared: the function and your browser config (user file, and a trusted project's for the worker's cwd: binary,
+  proxy, user agent, timeouts). Never shared: engines, tabs, storage profiles, cookies, logins, raw MCP, `/browser` commands.
+  Each call is the usual one-shot obscura process, killed on timeout or when the worker's run is aborted; main's
+  `/browser stop`, `restart` or `reset` do not touch it, and a worker cannot touch main's browser.
+- Public web only: `allowPrivateNetwork` is the main session's opt-in and is forced off for workers.
+- Always a direct tool (workers have no `tool_search`), whatever `exposure` says.
+- No consent bypass: when obscura is not installed the capability is refused (`browser_fetch unavailable: obscura is not
+  installed, and a worker cannot approve its download …`); the worker runs without the tool and is told why, and orche's
+  result carries `webFetchUnavailable`. Install it in the main session (`/browser install`), then start a new worker.
+- Session-type browsing (rendering, tabs, clicks, forms, sign-in) is not offered to workers here: give the task
+  `gui: true` (pi-gui) with a writing role (`implement`); pi-gui's private desktop opens only browsers with a disposable
+  profile, and read-only roles get an observe-only desktop there.
+
 ## Security and limitations
 
 - **Obscura's SSRF guard is on by default.** Private/loopback services need `/browser allow-private-network on` or trusted config opt-in. **Chrome has no equivalent private-network guard**; auto routing can access your development app. Navigate/fetch/tab-new permit only HTTP(S) URLs.

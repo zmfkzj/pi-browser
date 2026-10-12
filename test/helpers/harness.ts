@@ -84,6 +84,8 @@ export async function createHarness(options: {
     session, main, children, cwd, agentDir, notifications, statuses, errors, confirmations,
     get manager() { return manager!; },
     getMcpServers: () => extensionApi!.getMcpServers(),
+    /** The shared event bus other extensions (orche) use to ask this one for worker capabilities. */
+    get events() { return extensionApi!.events; },
     async shutdown() { await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" }); },
     async dispose() {
       await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });

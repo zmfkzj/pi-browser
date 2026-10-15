@@ -3,6 +3,8 @@ export interface CommandCompletion { value: string; label: string; description?:
 
 export const BROWSER_COMPLETIONS: readonly CommandCompletion[] = [
   { value: "status", label: "status", description: "Binary, engine and config status" },
+  { value: "doctor", label: "doctor", description: "Check obscura, platform, config and the optional Chrome engine; tells what to fix" },
+  { value: "install-deps", label: "install-deps", description: "Install missing obscura (verified release) and chrome-devtools-mcp; reports manual steps" },
   { value: "engine", label: "engine", description: "Show the active engine" },
   { value: "engine obscura", label: "engine obscura", description: "Switch to the obscura engine" },
   { value: "engine chrome", label: "engine chrome", description: "Switch to the Chrome engine" },

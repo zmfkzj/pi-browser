@@ -225,6 +225,8 @@ Chrome-only tools are deferred in hybrid mode. Network presets: `Offline`, `Slow
 
 ```text
 /browser status
+/browser doctor
+/browser install-deps
 /browser engine [obscura|chrome]
 /browser stop
 /browser restart
@@ -242,6 +244,31 @@ Chrome-only tools are deferred in hybrid mode. Network presets: `Offline`, `Slow
   - Binary precedence: `Installed to <cache path>, but binary resolution currently uses <source>: <path>. Remove binaryPath / PI_BROWSER_OBSCURA_BIN / the PATH entry to use the managed binary.`
 - `allow-private-network on|off`: preserve user-config keys, validate values, write pretty 2-space JSON plus a trailing newline with `0600`, reload config, and restart only if running. A trusted project setting wins; the command warns about that override. Invalid existing JSON is not overwritten.
 - `profile save|load|clear [name]`: export to, import from, or delete a named profile. Name defaults to `config.profile ?? "default"` and must match `/^[\w.-]{1,64}$/`. Saving overwrites that profile; loading requires the file to exist. Clearing deletes the file, not the current cookie jar.
+
+### Dependency check and install (`doctor`, `install-deps`)
+
+`/browser doctor` is a read-only health check; `/browser install-deps` installs what can be installed safely and prints the same report. Both are exact words (`/browser doctor now` or `/browser install-deps 0.2.4` print the usage, and `install`/`install <version>` keep their meaning). The umbrella package runs the same checks for every package with `/oh-my-pi doctor` and `/oh-my-pi install-deps` (event channel `oh-my-pi-extensions:dependencies`, provider id `browser`; contract in `src/dependencies.ts`, browser logic in `src/doctor.ts`). Each line reads `[status] item: detail`, followed by `-> action` when you need to do something; statuses are `ok`, `installed`, `warn` (optional feature), `error`, `failed`, `manual` and `unverified`.
+
+What `doctor` checks (it never downloads, writes config or starts a browser; subprocesses and probes time out after 5 s):
+
+| Item | Required? | Check | Remediation shown |
+| --- | --- | --- | --- |
+| `browser config` | required | `loadBrowserConfig` over the user and (trusted) project `browser.config.json`; an invalid file is ignored as a whole | `error` naming the file to fix (parse-error snippets and URL credentials are not echoed) |
+| `platform` | required | release asset for the OS/CPU (Linux/macOS x86_64 and aarch64, Windows x86_64) | `manual`: build obscura from source and set `binaryPath` / `PI_BROWSER_OBSCURA_BIN` (`ok` if such a binary already resolves) |
+| `glibc` | Linux only | Node's runtime glibc version (read-only, no subprocess); release binaries need 2.35+ | `manual` below 2.35, `unverified` when Node reports no glibc (musl); not required when a non-managed binary is in use |
+| `obscura binary` | required | the real resolution order `binaryPath` → `PI_BROWSER_OBSCURA_BIN` → PATH → managed cache for the configured `version`, then `obscura --version` (the managed binary must report the configured version) | `error` with `/browser install-deps`, or the exact override to fix |
+| `obscura override …` | optional | a `binaryPath` / `PI_BROWSER_OBSCURA_BIN` that is not an executable file while a later candidate resolves (resolution silently skips it) | `warn`: fix or remove the override |
+| `chrome-devtools-mcp npm package` | optional unless `engine: "chrome"` | the pinned package resolves from pi-browser (as the Chrome engine does; never `npx`) and matches the pinned version | `/browser install-deps` |
+| `Chrome browser` | optional unless `engine: "chrome"` | `chrome.executablePath`, or an HTTP probe of `chrome.browserUrl`'s `/json/version` (only that configured endpoint), or an installed Chrome on PATH / default location | install Chrome yourself or set `chrome.executablePath` / `chrome.browserUrl` |
+
+With `chrome.enabled: false` the Chrome items collapse into one `ok` `Chrome engine` line (an `error` if `engine` is `"chrome"`). Doctor reads the config files on disk, so it can report changes that the running session applies only after `/browser restart`.
+
+What `install-deps` does:
+
+- **obscura, automatically** when nothing resolves (or the managed binary fails its check): the same verified, atomic installer as `/browser install`, for the configured `version` and `variant`, with download progress in the status line. It never persists a version and runs at most once at a time (a concurrent `/browser install` or `install-deps` joins the running download). It re-runs resolution and `obscura --version` afterwards and reports `installed` only if that passes, otherwise `failed` with the error and how to retry.
+- **chrome-devtools-mcp, automatically** when missing (and Chrome is enabled): `npm install --legacy-peer-deps` in the pi-browser directory, then a re-check. In an npm-installed copy (inside `node_modules`) or without npm it reports `manual` (reinstall with `pi install` / `pi update --extensions`).
+- **Manual** (reported with the exact step, never done for you): a broken `binaryPath` / `PI_BROWSER_OBSCURA_BIN` / PATH binary — install-deps does not download behind or over a binary you configured (use `/browser install` explicitly to download into the managed cache anyway, which warns about the precedence); unsupported platforms and glibc < 2.35 (no download that cannot run); Google Chrome itself (pi-browser never downloads Chrome or Chromium) and a Chrome attach endpoint that is not running; invalid config files.
+- Already present items are `ok` ("already available" / "already installed"), so repeating the command is safe.
 
 ## Storage profiles
 
@@ -294,12 +321,13 @@ pi-browser answers orche's `web-fetch` worker capability (`src/worker.ts`): ever
 
 | Symptom | Action |
 | --- | --- |
+| Not sure what is missing | Run `/browser doctor`; `/browser install-deps` installs obscura and chrome-devtools-mcp and lists the remaining manual steps |
 | Private/internal IP blocked | Use `/browser allow-private-network on` for trusted local services; check whether a trusted project config overrides it |
 | Hung page script or stale state | Run `/browser restart`; tabs are lost, then navigate again |
 | Unknown/stale ref | Call `browser_snapshot` and use the latest refs |
 | Binary not found/download declined | Run `/browser install`, set `binaryPath`/`PI_BROWSER_OBSCURA_BIN`, or add an executable to PATH; inspect `/browser status` |
 | Chrome not found | Install Google Chrome or set `chrome.executablePath` / `chrome.browserUrl`; inspect availability in `/browser status` |
-| Chrome MCP package missing | Run `npm install` inside pi-browser; the server is pinned and never launched via npx |
+| Chrome MCP package missing | Run `/browser install-deps` (or `npm install` inside pi-browser); the server is pinned and never launched via npx |
 | Chrome server fails to start | Inspect the tool error's stderr tail and `/browser status` (flags/executable/stderr); check Node version and executable permissions |
 | DISPLAY missing / headed launch fails | Use `chrome.headless: true`; auto is headless when both display variables are absent |
 | Chrome upload denied | Use temp/session-cwd files or add an explicit trusted `--workspace` root via `chrome.args` |

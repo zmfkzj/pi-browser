@@ -36,7 +36,7 @@ export function chromeAvailability(config: BrowserConfig, env: NodeJS.ProcessEnv
   const names = ["google-chrome", "google-chrome-stable", "chromium", "chromium-browser", "chrome"];
   const candidates = (overrides.pathDirs ?? (env.PATH ?? "").split(platform === "win32" ? ";" : delimiter)).filter(Boolean).flatMap(dir => names.map(name => join(dir, name + (platform === "win32" ? ".exe" : ""))));
   if (platform === "darwin") candidates.push("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome");
-  else if (platform === "win32") for (const dir of [env.ProgramFiles, env["ProgramFiles(x86)"], env.LOCALAPPDATA]) if (dir) candidates.push(join(dir, "Google", "Chrome", "Application", "chrome.exe"));
+  else if (platform === "win32") { for (const dir of [env.ProgramFiles, env["ProgramFiles(x86)"], env.LOCALAPPDATA]) if (dir) candidates.push(join(dir, "Google", "Chrome", "Application", "chrome.exe")); }
   else candidates.push("/opt/google/chrome/chrome");
   const executablePath = candidates.find(exists);
   return executablePath ? { ok: true, executablePath, serverBin } : missing();

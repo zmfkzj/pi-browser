@@ -20,6 +20,8 @@ import { decodeEvaluation, wrapExpression } from "../evaluate.js";
 import { applyPendingStorage, restoreStorageState, validateRestorableState } from "../state.js";
 import { completeBrowserArguments } from "./completions.js";
 import { answerWebFetch, isWorkerCapabilityRequest, WEB_FETCH_CAPABILITY, WORKER_CAPABILITY_CHANNEL } from "../worker.js";
+import { formatDependencyReport, registerDependencyProvider, type DependencyProvider, type DependencyReport } from "../dependencies.js";
+import { createBrowserDependencyProvider, type BrowserDependencyProbes } from "../doctor.js";
 export { decodeEvaluation, wrapExpression } from "../evaluate.js";
 
 export interface BrowserExtensionOptions {
@@ -36,9 +38,11 @@ export interface BrowserExtensionOptions {
   engineFactories?: Partial<Record<EngineName, () => BrowserEngine>>;
   engineAvailability?: Partial<Record<EngineName, () => Availability>>;
   onManager?: (manager: EngineManager) => void;
+  /** Test/embedding seam for `/browser doctor` and `/browser install-deps` (glibc, probes, npm, Chrome detection). */
+  dependencies?: BrowserDependencyProbes;
 }
 
-export const BROWSER_USAGE = "Usage: /browser status | engine [obscura|chrome] | stop | restart | install [version] | allow-private-network on|off | profile save|load|clear [name] (stop: all engines; restart: active engine)";
+export const BROWSER_USAGE = "Usage: /browser status | doctor | install-deps | engine [obscura|chrome] | stop | restart | install [version] | allow-private-network on|off | profile save|load|clear [name] (stop: all engines; restart: active engine)";
 const REF_GUIDELINE = "Browser refs are engine-specific and are invalidated by every action and navigation; use the refs from the latest result.";
 
 
@@ -105,14 +109,14 @@ export function createBrowserExtension(options: BrowserExtensionOptions = {}) {
       const key = JSON.stringify(config);
       if (key !== rawRegistration) { pi.registerMcpServer("obscura", config); rawRegistration = key; }
     };
-    const install = (ctx: ExtensionContext, version: string, signal?: AbortSignal): Promise<InstallObscuraResult> => {
+    const install = (ctx: ExtensionContext, version: string, signal?: AbortSignal, variant: BrowserConfig["variant"] = loaded.config.variant): Promise<InstallObscuraResult> => {
       if (installing) return installing;
       installController = new AbortController();
       const abort = () => installController?.abort(signal?.reason);
       signal?.addEventListener("abort", abort, { once: true });
       if (signal?.aborted) abort();
       installing = Promise.resolve().then(() => (options.install ?? installObscura)({
-        version, variant: loaded.config.variant, platform: process.platform, arch: process.arch, agentDir,
+        version, variant, platform: process.platform, arch: process.arch, agentDir,
         signal: installController!.signal,
         onProgress: ({ receivedBytes, totalBytes }) => {
           if (ctx.hasUI) ctx.ui.setStatus("browser", totalBytes
@@ -291,11 +295,44 @@ export function createBrowserExtension(options: BrowserExtensionOptions = {}) {
       });
     };
     registerTools();
+    // `/browser doctor`, `/browser install-deps` and the umbrella's `/oh-my-pi doctor|install-deps` (src/doctor.ts).
+    // check() reads the config files on disk; install() downloads obscura only through the verified `install` path above.
+    const dependencyCore = createBrowserDependencyProvider<ExtensionContext>({
+      agentDir, env: options.env, pathDirs: options.pathDirs, ...options.dependencies,
+      installObscura: async (ctx, config) => {
+        const installed = await install(ctx, config.version, undefined, config.variant);
+        resolveBinary(); registerRaw();
+        return installed;
+      },
+    });
+    let installingDependencies: Promise<DependencyReport> | undefined;
+    const dependencyProvider: DependencyProvider<ExtensionContext> = {
+      ...dependencyCore,
+      install: ctx => installingDependencies ??= (async () => {
+        if (ctx.hasUI) ctx.ui.setStatus("browser", "browser: installing dependencies…");
+        try { return await dependencyCore.install(ctx); }
+        finally {
+          const state = manager?.active()?.status();
+          if (ctx.hasUI) ctx.ui.setStatus("browser", state?.running ? `browser: running (pid ${state.pid})` : "browser: idle");
+        }
+      })().finally(() => { installingDependencies = undefined; }),
+    };
+    registerDependencyProvider(pi.events, dependencyProvider);
     pi.registerCommand("browser", {
       description: BROWSER_USAGE,
       getArgumentCompletions: completeBrowserArguments,
       async handler(args, ctx) {
         const command = args.trim();
+        // Exact words only: `install` and `install <version>` keep their grammar (`install-deps` never matched it).
+        if (command === "doctor" || command === "install-deps") {
+          const mode = command === "doctor" ? "check" : "install";
+          try {
+            const report = mode === "check" ? await dependencyProvider.check(ctx) : await dependencyProvider.install(ctx);
+            const { text, level } = formatDependencyReport(dependencyProvider.label, report, mode);
+            ctx.ui.notify(text, level);
+          } catch (error) { ctx.ui.notify(`browser: ${command} failed: ${error instanceof Error ? error.message : String(error)}`, "error"); }
+          return;
+        }
         const installMatch = /^install(?:\s+(\d+\.\d+\.\d+(?:-[\w.-]+)?))?$/.exec(command);
         const networkMatch = /^allow-private-network\s+(on|off)$/.exec(command);
         const engineMatch = /^engine(?:\s+(obscura|chrome))?$/.exec(command);

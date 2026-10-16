@@ -26,8 +26,17 @@ export async function createHarness(options: {
   launchChrome?: () => ChildProcess;
   confirm?: boolean | ((title: string, message: string) => boolean | Promise<boolean>);
   hasUI?: boolean;
+  /** Directories of an earlier harness to resume in; that harness's `dispose()` removes them. */
+  root?: string;
+  /** Session storage, in memory by default. */
+  sessionManager?: (cwd: string) => SessionManager;
+  /** More createAgentSession options, such as `excludeTools`. */
+  sessionOptions?: Partial<Parameters<typeof createAgentSession>[0]>;
+  /** Extensions loaded after the browser extension. */
+  extensionFactories?: ((pi: ExtensionAPI) => void)[];
 } = {}) {
-  const root = await mkdtemp(join(tmpdir(), "browser-extension-"));
+  const ownsRoot = !options.root;
+  const root = options.root ?? await mkdtemp(join(tmpdir(), "browser-extension-"));
   const cwd = join(root, "project");
   const agentDir = join(root, "agent");
   await mkdir(cwd, { recursive: true });
@@ -58,13 +67,13 @@ export async function createHarness(options: {
         }, ...options.extension,
         onManager: (value) => { manager = value; options.extension?.onManager?.(value); },
       })(pi);
-    }],
+    }, ...options.extensionFactories ?? []],
   });
   await resourceLoader.reload();
   const model = main.runtime.getModel(main.faux.provider.id, main.faux.getModel().id)!;
   const { session } = await createAgentSession({
     cwd, agentDir, modelRuntime: main.runtime, model, thinkingLevel: "off", resourceLoader,
-    settingsManager, sessionManager: SessionManager.inMemory(cwd),
+    settingsManager, sessionManager: options.sessionManager?.(cwd) ?? SessionManager.inMemory(cwd), ...options.sessionOptions,
   });
   const notifications: { message: string; type?: string }[] = [];
   const statuses: { key: string; text?: string }[] = [];
@@ -81,7 +90,7 @@ export async function createHarness(options: {
   session.extensionRunner.onError((error) => { errors.push(error.error); });
   await session.bindExtensions(options.hasUI === false ? {} : { uiContext });
   return {
-    session, main, children, cwd, agentDir, notifications, statuses, errors, confirmations,
+    session, main, children, root, cwd, agentDir, notifications, statuses, errors, confirmations,
     get manager() { return manager!; },
     getMcpServers: () => extensionApi!.getMcpServers(),
     /** The shared event bus other extensions (orche) use to ask this one for worker capabilities. */
@@ -92,7 +101,7 @@ export async function createHarness(options: {
       session.dispose();
       // Test-failure safety net; extension lifecycle assertions run before this cleanup.
       for (const child of children) if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
-      await rm(root, { recursive: true, force: true });
+      if (ownsRoot) await rm(root, { recursive: true, force: true });
     },
   };
 }

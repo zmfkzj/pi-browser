@@ -175,7 +175,9 @@ Default **hybrid** mode keeps the common workflow direct and defers specialist t
 - **Direct (9):** `browser_navigate`, `browser_snapshot`, `browser_click`, `browser_fill`, `browser_type`, `browser_wait`, `browser_screenshot`, `browser_evaluate`, `browser_fetch`.
 - **Deferred (13):** `browser_tabs`, `browser_extract`, `browser_state`, `browser_pdf`, `browser_press_key`, `browser_select`, `browser_scroll`, `browser_hover`, `browser_upload`, `browser_dialog`, `browser_emulate`, `browser_perf`, `browser_network_request`.
 
-`direct` exposes all 22 tools; `deferred` initially exposes none. Deferred tools remain registered: use Pi's built-in `tool_search`, e.g. `{ "query": "browser_perf", "limit": 1 }`, to find and activate them. The extension enables `tool_search` when registered and browser tools are deferred. Direct tools include a guideline generated from the deferred table.
+`direct` exposes all 22 tools; `deferred` initially exposes none. Deferred tools remain registered: use Pi's built-in `tool_search`, e.g. `{ "query": "browser_perf", "limit": 1 }`, to find and activate them. The extension enables `tool_search` when registered and browser tools are deferred, unless explicitly disabled. Direct tools include a guideline generated from the deferred table.
+
+On Pi 1.3.0, search-enabled tools survive persisted resume and `/reload`; a native new session starts with the defaults again. An exposure setting change removes defaults that become deferred, but does not discard already loaded specialist tools or other extensions' late tools. The applied mode is a non-model session entry (`browser-exposure`); older sessions without one use the historical hybrid baseline. CLI allowlists, `--exclude-tools`, `--no-tools` and negative CLI/settings modifiers are respected (use `--exclude-tools` for a hard exclusion). SDK `noTools: "all"` is the equivalent of CLI `--no-tools`, not `noTools: true` (built-in tools only).
 
 
 ## Tools and workflow
@@ -340,6 +342,8 @@ pi-browser answers orche's `web-fetch` worker capability (`src/worker.ts`): ever
 ## Development and verification
 
 With the existing development dependencies available, from `browser/`:
+
+The development SDK/lock baseline is **Pi 1.3.0**, with host-provided `*` peers unchanged. `test/restore.test.ts` checks real JSONL reopen, reload, exposure transitions and other late tools against the next model request. The umbrella adds native runtime replacement and actual CLI argument/settings tests. These lifecycle checks use a faux model and fake/no browser engines, not live-browser compatibility claims.
 
 ```sh
 npx tsc --noEmit

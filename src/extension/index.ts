@@ -2,9 +2,9 @@ import type { ChildProcess } from "node:child_process";
 import { chmod, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { Type, type TSchema } from "@sinclair/typebox";
-import { getAgentDir, type ExtensionAPI, type ExtensionContext, type ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, parseArgs, type ExtensionAPI, type ExtensionContext, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { managedBinaryPath, managedCacheDir, resolveObscuraBinary, type BinaryResolution } from "../binary.js";
-import { DEFAULT_BROWSER_CONFIG, isValidProfileName, loadBrowserConfig, validateBrowserConfig, type BrowserConfig, type LoadedBrowserConfig } from "../config.js";
+import { DEFAULT_BROWSER_CONFIG, isValidProfileName, loadBrowserConfig, validateBrowserConfig, type BrowserConfig, type Exposure, type LoadedBrowserConfig } from "../config.js";
 import { storageState } from "../actions.js";
 import { installObscura, type InstallObscuraResult } from "../install.js";
 import { buildObscuraArgs, ObscuraEngine } from "../engines/obscura.js";
@@ -44,13 +44,17 @@ export interface BrowserExtensionOptions {
 
 export const BROWSER_USAGE = "Usage: /browser status | doctor | install-deps | engine [obscura|chrome] | stop | restart | install [version] | allow-private-network on|off | profile save|load|clear [name] (stop: all engines; restart: active engine)";
 const REF_GUIDELINE = "Browser refs are engine-specific and are invalidated by every action and navigation; use the refs from the latest result.";
+/** Session entry recording the exposure mode the active browser tools follow, so a change applies to a resumed or reloaded session. */
+const EXPOSURE_ENTRY = "browser-exposure";
 
 
 export function createBrowserExtension(options: BrowserExtensionOptions = {}) {
   return function browserExtension(pi: ExtensionAPI): void {
     const agentDir = options.agentDir ?? getAgentDir();
     const now = options.now ?? Date.now;
-    let loaded: LoadedBrowserConfig = { config: { ...DEFAULT_BROWSER_CONFIG }, sources: [], errors: [] };
+    // Until session_start reads the config, tools register deferred: Pi then activates none of them on its own (a fresh
+    // session, or the extension tools Pi re-activates on /reload), and the session's config activates its direct ones.
+    let loaded: LoadedBrowserConfig = { config: { ...DEFAULT_BROWSER_CONFIG, exposure: "deferred" }, sources: [], errors: [] };
     let resolution: BinaryResolution | undefined;
     let manager: EngineManager | undefined;
     let obscura: ObscuraEngine | undefined;
@@ -216,7 +220,8 @@ export function createBrowserExtension(options: BrowserExtensionOptions = {}) {
       });
       options.onManager?.(manager);
       registerTools();
-      updateExposure();
+      seedExposure(ctx);
+      updateExposure(false);
       for (const error of loaded.errors) ctx.ui.notify(`browser: ${error}`, "warning");
       if (resolution && !resolution.ok) {
         if (loaded.config.autoInstall === "ask") {
@@ -233,12 +238,58 @@ export function createBrowserExtension(options: BrowserExtensionOptions = {}) {
       return manager!;
     };
     const getEngine = async (ctx: ExtensionContext, signal?: AbortSignal) => (await getManager(ctx, signal)).require();
-    const updateExposure = () => {
-      const active = pi.getActiveTools().filter(name => !registeredNames.has(name));
-      const direct = [...registeredNames].filter(name => toolExposure(name, loaded.config.exposure) === "direct");
-      // Pi 0.99.2 registers tool_search but explicit active filtering must retain/enable it.
-      if (direct.length < registeredNames.size && pi.getAllTools().some(t => t.name === "tool_search") && !active.includes("tool_search")) active.push("tool_search");
-      pi.setActiveTools([...active, ...direct]);
+    // Exposure each browser tool had when the active set last followed the config, and the session's recorded mode. A
+    // tool leaves the active set only when the config stops declaring it directly: Pi restores a resumed session's tools
+    // and keeps them across /reload, including deferred ones a tool_search loaded, and it must not lose them here.
+    const applied = new Map<string, "direct" | "deferred">();
+    let recordedExposure: Exposure = DEFAULT_BROWSER_CONFIG.exposure;
+    /** Tools to deactivate that the config no longer declares directly, waiting for the next run (see updateExposure). */
+    const demote = new Set<string>();
+    const seedExposure = (ctx: ExtensionContext) => {
+      recordedExposure = DEFAULT_BROWSER_CONFIG.exposure;
+      for (const entry of ctx.sessionManager.getBranch()) {
+        const exposure = entry.type === "custom" && entry.customType === EXPOSURE_ENTRY ? (entry.data as { exposure?: unknown } | undefined)?.exposure : undefined;
+        if (exposure === "hybrid" || exposure === "direct" || exposure === "deferred") recordedExposure = exposure;
+      }
+      applied.clear();
+      demote.clear();
+      for (const name of registeredNames) applied.set(name, toolExposure(name, recordedExposure));
+    };
+    // setActiveTools is an explicit activation API, not a default selector. Preserve negative default modifiers when
+    // auto-enabling browser defaults/search. CLI options are not exposed by ExtensionContext; use Pi's public parser,
+    // not a second flag grammar. Hard exclusions/allowlists (--no-tools included) remain enforced by Pi's registry.
+    const defaultDisabled = () => {
+      const cli = parseArgs(process.argv.slice(2));
+      const entries = [...(pi.getSettings?.().defaultTools ?? []), ...(cli.tools ?? [])];
+      const disabled = new Set<string>();
+      for (const entry of entries) {
+        if (entry.startsWith("-")) disabled.add(entry.slice(1));
+        else disabled.delete(entry.startsWith("+") ? entry.slice(1) : entry);
+      }
+      return disabled;
+    };
+    /**
+     * Activate config defaults without replacing restored/search-enabled tools. Deactivation waits until the first run:
+     * setActiveTools would otherwise clear Pi's pending restoration of other extensions' late (for example MCP) tools.
+     */
+    const updateExposure = (deactivate = true) => {
+      const mode = loaded.config.exposure;
+      const disabled = defaultDisabled();
+      for (const name of registeredNames) {
+        const exposure = toolExposure(name, mode);
+        if (applied.get(name) === "direct" && exposure !== "direct") demote.add(name);
+        if (exposure === "direct") demote.delete(name);
+        if (disabled.has(name)) demote.add(name);
+        applied.set(name, exposure);
+      }
+      const active = pi.getActiveTools();
+      const next = active.filter(name => !(deactivate && demote.has(name)));
+      for (const name of registeredNames) if (toolExposure(name, mode) === "direct" && !disabled.has(name) && !next.includes(name)) next.push(name);
+      // Pi 0.99.2 registers tool_search inactive. Browser's deferred surface needs it unless the user opts out.
+      if (!disabled.has("tool_search") && [...registeredNames].some(name => toolExposure(name, mode) !== "direct") && pi.getAllTools().some(t => t.name === "tool_search") && !next.includes("tool_search")) next.push("tool_search");
+      if (next.length !== active.length || next.some(name => !active.includes(name))) pi.setActiveTools(next);
+      if (deactivate) demote.clear();
+      if (mode !== recordedExposure) { pi.appendEntry(EXPOSURE_ENTRY, { exposure: mode }); recordedExposure = mode; }
     };
     const refreshConfig = async (ctx: ExtensionContext) => {
       const next = await loadBrowserConfig({ cwd: ctx.cwd, agentDir, projectTrusted: ctx.isProjectTrusted() });
@@ -420,6 +471,8 @@ export function createBrowserExtension(options: BrowserExtensionOptions = {}) {
       loading = load(ctx).finally(() => { loading = undefined; });
       await loading;
     });
+    // A config change found when the session started takes effect with its first run (see updateExposure).
+    pi.on("before_agent_start", () => { if (demote.size > 0) updateExposure(); });
     pi.on("session_shutdown", async () => {
       installController?.abort(new Error("Browser session shutdown"));
       await installing?.catch(() => {});

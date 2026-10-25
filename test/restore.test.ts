@@ -5,7 +5,7 @@ import { SessionManager, type ExtensionAPI } from "@earendil-works/pi-coding-age
 import { Type } from "@sinclair/typebox";
 import { createHarness, tool, type Harness } from "./helpers/harness.js";
 
-// Pi 1.3.0 restores a resumed session's active tools from its transcript and keeps them across /reload; tools that
+// Pi 1.3.0+ restores a resumed session's active tools from its transcript and keeps them across /reload; tools that
 // register late (in session_start, like these) are activated once they register. These pin that the browser extension
 // keeps such tools, including the deferred ones a tool_search loaded, and other extensions' late tools.
 

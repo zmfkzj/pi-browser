@@ -305,8 +305,8 @@ pi-browser answers orche's `web-fetch` worker capability (`src/worker.ts`): ever
   installed, and a worker cannot approve its download …`); the worker runs without the tool and is told why, and orche's
   result carries `webFetchUnavailable`. Install it in the main session (`/browser install`), then start a new worker.
 - Session-type browsing (rendering, tabs, clicks, forms, sign-in) is not offered to workers here: give the task
-  `gui: true` (pi-gui) with a writing role (`implement`); pi-gui's private desktop opens only browsers with a disposable
-  profile, and read-only roles get an observe-only desktop there.
+  `gui: true` (pi-gui), with any role; pi-gui's private desktop opens only browsers with a disposable
+  profile, and read-only roles may click and type there while staying read-only for the workspace.
 
 ## Security and limitations
 

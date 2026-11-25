@@ -27,7 +27,7 @@ description: Use pi-browser to read web pages, interact with forms and authentic
 
 Workers lack main's browser tools, tabs, profiles, logins and `tool_search`. A listed `browser_fetch` is your own stateless
 public-page reader (private/loopback refused): use it, not `curl`; without it, say why. Interactive pages need your GUI desktop
-(`mcp__computer_use__*`, observe-only for read-only roles); else report the task needs `gui: true` with role implement.
+(`mcp__computer_use__*`, skill `pi-gui`; every role may click and type there); without one, report the task needs `gui: true`.
 
 ## Session workflow
 
